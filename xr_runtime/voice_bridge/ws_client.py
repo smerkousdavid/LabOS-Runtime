@@ -100,6 +100,12 @@ class NATWebSocketClient:
                 self._reconnect_delay * 2, self._max_reconnect_delay
             )
 
+    async def reset_session(self):
+        """Close the current WS connection; auto-reconnect will create a fresh session."""
+        if self._ws:
+            logger.info("[WS Client] Resetting session (closing connection)")
+            await self._ws.close()
+
     async def stop(self):
         self._running = False
         if self._ws:

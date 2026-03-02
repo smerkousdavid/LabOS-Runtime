@@ -212,6 +212,30 @@ def synthesize_route():
     return jsonify({'status': 'ok', 'rtsp_url': rtsp_path, 'model': model, 'index': index})
 
 
+@app.route('/synthesize_wav', methods=['POST'])
+def synthesize_wav_route():
+    """Synthesize text and return raw WAV bytes (for direct audio delivery to glasses)."""
+    data = request.get_json() or {}
+    text = data.get('text')
+    if not text:
+        return jsonify({'error': 'missing text'}), 400
+
+    model = data.get('model', available_models[0] if available_models else None)
+    if not model or model not in available_models:
+        return jsonify({'error': f'model "{model}" not available'}), 400
+
+    voice = data.get('voice')
+
+    try:
+        audio_bytes = synthesize_text(model, text, voice)
+    except Exception as e:
+        logger.exception(f"[{model}] synthesis failed")
+        return jsonify({'error': str(e)}), 500
+
+    from flask import Response
+    return Response(audio_bytes, mimetype='audio/wav')
+
+
 @app.route('/models', methods=['GET'])
 def list_models():
     """Return list of available TTS models."""

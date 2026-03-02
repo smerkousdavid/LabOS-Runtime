@@ -2,5 +2,6 @@ websockets>=12.0
 httpx>=0.25.0
 loguru>=0.7.0
 grpcio>=1.60.0
+nvidia-riva-client>=2.17.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0

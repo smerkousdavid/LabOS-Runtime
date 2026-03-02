@@ -8,8 +8,10 @@ Called by run.sh / run.bat.
 import argparse
 import os
 import platform
+import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -83,6 +85,55 @@ def wait_for_service(name: str, url: str, timeout: int = 30) -> bool:
     return False
 
 
+def wait_for_xr_connection(dashboard_port: int, timeout: int = 60) -> bool:
+    """Poll dashboard /api/status until xr_service_connected is true."""
+    import urllib.request
+    import json as _json
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = urllib.request.urlopen(
+                f"http://localhost:{dashboard_port}/api/status", timeout=3
+            )
+            data = _json.loads(resp.read())
+            if data.get("xr_service_connected"):
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def send_initial_status(dashboard_port: int, retries: int = 5) -> bool:
+    """Send the initial COMPONENTS_STATUS to glasses via the dashboard, with retries."""
+    import urllib.request
+    import json as _json
+    status_payload = _json.dumps({
+        "Voice_Assistant": "idle",
+        "Server_Connection": "inactive",
+        "Robot_Status": "N/A",
+    })
+    data = _json.dumps({
+        "message_type": "COMPONENTS_STATUS",
+        "payload": status_payload,
+    }).encode()
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{dashboard_port}/api/send_message",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=5)
+            if resp.status == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
 def watch_grpc_logs(camera: int = 1, timeout: int = 0):
     """Watch gRPC server logs for client connection events.
 
@@ -112,6 +163,81 @@ def create_log_dirs(num_cameras: int):
 
 
 # ---------------------------------------------------------------------------
+# Live voice-bridge log tail
+# ---------------------------------------------------------------------------
+
+_BRIDGE_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\[STT\] Raw: (.+)"),           "dim"),
+    (re.compile(r"\[STT\] Accepted: (.+)"),       "bold green"),
+    (re.compile(r"\[WakeWord\] State: (.+)"),     "bold yellow"),
+    (re.compile(r"\[TTS\] Speaking: (.+)"),        "bold cyan"),
+    (re.compile(r"\[Session\] (.+)"),              "bold magenta"),
+]
+
+
+def _format_bridge_line(raw: str) -> str | None:
+    """Parse a voice-bridge log line and return rich-formatted text, or None."""
+    for pattern, style in _BRIDGE_PATTERNS:
+        m = pattern.search(raw)
+        if m:
+            tag = pattern.pattern.split(r"\]")[0].replace("\\[", "") + "]"
+            return f"[{style}]{tag} {m.group(1)}[/{style}]"
+    return None
+
+
+def _tail_voice_bridge(con: Console, reset_mode: str):
+    """Tail docker compose logs for voice-bridge-1, pretty-print STT/TTS events.
+
+    Also watches for glasses disconnect and handles session reset logic.
+    """
+    proc = subprocess.Popen(
+        ["docker", "compose", "-f", "compose.yaml", "logs", "-f", "--tail", "0",
+         "voice-bridge-1"],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    glasses_was_connected = True
+
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if not line:
+                break
+
+            formatted = _format_bridge_line(line)
+            if formatted:
+                con.print(formatted)
+
+            # Detect glasses disconnect via repeated audio decoder restarts
+            if "[Session] Glasses disconnected" in line:
+                glasses_was_connected = False
+                con.print("[bold magenta]Glasses disconnected.[/bold magenta]")
+
+                if reset_mode == "ask":
+                    answer = con.input(
+                        "[yellow]Reset session (close NAT connection)? [y/N]:[/yellow] "
+                    ).strip().lower()
+                    if answer in ("y", "yes"):
+                        con.print("[dim]Restarting voice bridge ...[/dim]")
+                        run(["docker", "compose", "-f", "compose.yaml",
+                             "restart", "voice-bridge-1"], capture=True)
+                        con.print("[green]Voice bridge restarted (session reset).[/green]")
+
+            # Detect glasses reconnection
+            if "[Bridge] Audio stream active" in line and not glasses_was_connected:
+                glasses_was_connected = True
+                con.print("[bold green]Glasses reconnected.[/bold green]")
+
+    except KeyboardInterrupt:
+        con.print("\n[dim]Detached from live feed. Services continue in background.[/dim]")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=3)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -123,6 +249,7 @@ def main():
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild images")
     parser.add_argument("--update-glasses", action="store_true", help="Run glasses config utility")
     parser.add_argument("--stop", action="store_true", help="Stop all services")
+    parser.add_argument("--skip-checks", action="store_true", help="Skip connectivity checks")
     args = parser.parse_args()
 
     console.print()
@@ -140,6 +267,36 @@ def main():
     cfg = load_config()
     num_cameras = args.cameras or cfg.get("runtime", {}).get("num_cameras", 1)
     nat_url = cfg.get("nat_server", {}).get("url", "ws://localhost:8002/ws")
+
+    # ── Load secrets into environment before any API checks ─────────────
+    secrets_file = cfg.get("global", {}).get("secrets_file", "config/.env.secrets")
+    secrets_path = ROOT / secrets_file
+    if secrets_path.exists():
+        with open(secrets_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip()
+                if v and k not in os.environ:
+                    os.environ[k] = v
+
+    # ── Connectivity checks ───────────────────────────────────────────────
+    if not args.skip_checks:
+        from test_models import run_tests, print_results
+        results = run_tests(cfg)
+        print_results(results, console=console)
+        console.print()
+
+        failed = [r for r in results if not r.ok]
+        if failed:
+            answer = console.input(
+                f"[yellow]{len(failed)} service(s) unreachable.[/yellow] Continue anyway? [y/N]: "
+            ).strip().lower()
+            if answer not in ("y", "yes"):
+                console.print("[dim]Aborted.[/dim]")
+                return
 
     # ── Glasses update ────────────────────────────────────────────────────
     if args.update_glasses:
@@ -219,35 +376,14 @@ def main():
     console.print(table)
     console.print()
 
-    # ── Send initial status to glasses ────────────────────────────────────
-    import urllib.request
-    import json
-    try:
-        status_payload = json.dumps({
-            "Voice_Assistant": "idle",
-            "Server_Connection": "inactive",
-            "Robot_Status": "N/A",
-        })
-        data = json.dumps({
-            "message_type": "COMPONENTS_STATUS",
-            "payload": status_payload,
-        }).encode()
-        req = urllib.request.Request(
-            f"http://localhost:{dashboard_port}/api/send_message",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=3)
-    except Exception:
-        pass
-
     # ── Monitor for glasses connection ────────────────────────────────────
     console.print("Waiting for glasses to connect (Ctrl+C to run in background) ...")
+    glasses_connected = False
     try:
         for _ in range(60):
             if watch_grpc_logs():
                 console.print("[green bold]XR glasses connected![/green bold]")
+                glasses_connected = True
                 break
             time.sleep(2)
         else:
@@ -262,7 +398,28 @@ def main():
     console.print(f"  NAT Agent:  {nat_url}")
     console.print(f"  Logs:       {ROOT / 'logs'}/")
     console.print()
-    console.print("Run [bold]./stop.sh[/bold] or [bold]python scripts/launcher.py --stop[/bold] to shut down.")
+
+    # ── Send initial status once XR socket is ready ─────────────────────
+    if glasses_connected:
+        console.print("[dim]Waiting for dashboard XR socket connection ...[/dim]")
+        if wait_for_xr_connection(dashboard_port, timeout=30):
+            if send_initial_status(dashboard_port):
+                console.print("[green]Initial COMPONENTS_STATUS sent to glasses.[/green]")
+            else:
+                console.print("[yellow]Warning: failed to send initial status.[/yellow]")
+        else:
+            console.print("[yellow]Warning: dashboard XR socket not connected yet.[/yellow]")
+
+    # ── Live voice bridge monitoring ──────────────────────────────────────
+    reset_mode = cfg.get("session", {}).get("reset_on_disconnect", "false")
+
+    if glasses_connected:
+        console.print(Panel("[bold]Live Voice Bridge Feed[/bold]  (Ctrl+C to detach)",
+                            style="blue", padding=(0, 1)))
+        _tail_voice_bridge(console, reset_mode)
+    else:
+        console.print("Run [bold]./stop.sh[/bold] or [bold]python scripts/launcher.py --stop[/bold] to shut down.")
+
     console.print()
 
 

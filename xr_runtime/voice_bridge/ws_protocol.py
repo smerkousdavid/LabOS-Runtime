@@ -29,6 +29,14 @@ class AudioStream(TypedDict):
     seq: int
 
 
+class VideoStream(TypedDict):
+    type: Literal["video_stream"]
+    data: str           # base64-encoded JPEG
+    width: int
+    height: int
+    seq: int
+
+
 class StreamInfo(TypedDict):
     type: Literal["stream_info"]
     camera_index: int
@@ -84,11 +92,11 @@ class Pong(TypedDict):
 
 # ---- Type unions for dispatch ------------------------------------------------
 
-InboundMessage = UserMessage | FrameResponse | AudioStream | StreamInfo | Ping
+InboundMessage = UserMessage | FrameResponse | AudioStream | VideoStream | StreamInfo | Ping
 OutboundMessage = AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly | WakeTimeout | Pong
 
 # All valid type strings
-INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "stream_info", "ping"}
+INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "video_stream", "stream_info", "ping"}
 OUTBOUND_TYPES = {"agent_response", "notification", "display_update", "request_frames", "tts_only", "wake_timeout", "pong"}
 
 
@@ -104,6 +112,10 @@ def make_frame_response(request_id: str, frames: List[str]) -> FrameResponse:
 
 def make_audio_stream(data: str, sample_rate: int, seq: int) -> AudioStream:
     return {"type": "audio_stream", "data": data, "sample_rate": sample_rate, "seq": seq}
+
+
+def make_video_stream(data: str, width: int, height: int, seq: int) -> VideoStream:
+    return {"type": "video_stream", "data": data, "width": width, "height": height, "seq": seq}
 
 
 def make_stream_info(camera_index: int, rtsp_base: str, paths: Dict[str, str]) -> StreamInfo:

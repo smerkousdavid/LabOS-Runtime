@@ -25,6 +25,9 @@ services:
     volumes:
       - ./xr_runtime/streaming/mediamtx.yml:/mediamtx.yml
       - ./logs/mediamtx:/logs
+{% if recording_enabled %}
+      - {{ recordings_path }}:/recordings
+{% endif %}
 {% endif %}
 
   # ===========================================================================
@@ -120,6 +123,7 @@ services:
     volumes:
       - xr_socket_{{ i+1 }}:/tmp
       - ./logs/voice_bridge_{{ i+1 }}:/app/logs
+    env_file: .env
     environment:
       - NAT_SERVER_URL={{ nat_server_url }}
       - CAMERA_INDEX={{ i+1 }}
@@ -128,11 +132,18 @@ services:
       - STT_HOST={{ stt_host }}
       - STT_PORT={{ stt_port }}
       - STT_PROTOCOL={{ stt_protocol }}
+      - STT_MODEL={{ stt_model }}
       - TTS_PUSHER_URL={{ tts_pusher_url }}
       - DASHBOARD_URL={{ dashboard_url }}
       - SOCKET_PATH=/tmp/xr_service.sock
       - FORWARD_AUDIO={{ forward_audio }}
+      - FORWARD_FRAMES={{ forward_frames }}
+      - FRAME_WIDTH={{ frame_width }}
+      - FRAME_HEIGHT={{ frame_height }}
+      - FRAME_FPS={{ frame_fps }}
+      - RTSP_EXTERNAL_HOST={{ rtsp_external_host }}
       - TTS_MODEL={{ tts_model }}
+      - RESET_SESSION_ON_DISCONNECT={{ reset_session }}
       - LOGURU_LEVEL=INFO
     restart: unless-stopped
     logging: *default-logging

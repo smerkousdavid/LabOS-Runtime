@@ -72,11 +72,44 @@ stop.bat              # Windows
 | `nvr` | Optional Shinobi NVR for video recording |
 | `wakeword` | Wake words, timeout, sleep commands |
 
-No API keys are needed on the desktop app. All model inference and web search keys live on the server side (labos-nat, labos-models).
+No API keys are needed on the desktop app unless using cloud STT/TTS (e.g. ElevenLabs).
 
 ### `config/.env.secrets`
 
-Only needed if running model services locally (not typical for desktop use).
+API keys for cloud services (ElevenLabs, DashScope, NGC). Copy `config/.env.secrets.example` and fill in values. Keys are injected into `.env` at configure time.
+
+### RTSP Streams
+
+Each camera produces three RTSP streams on MediaMTX (port 8554):
+
+| Stream | Path pattern | Content |
+|---|---|---|
+| Video only | `NB_XXXX_TX_CAM_RGB` | H.264 video from glasses camera |
+| Audio only | `NB_XXXX_TX_MIC_p6S` | PCM audio from glasses microphone |
+| Merged | `NB_XXXX_TX_CAM_RGB_MIC_p6S` | Combined audio + video |
+
+Where `XXXX` is the zero-padded camera index (e.g. `0001`).
+
+The RTSP host is auto-detected at configure time. When `rtsp.external_host` is `"auto"` (the default):
+1. If the NAT server is on a Tailscale network (100.x.x.x), the local Tailscale IPv4 is used
+2. Otherwise, the local IP that routes to the NAT server is detected via UDP
+3. Falls back to `localhost` if neither works
+
+The resolved IP is written to `.env` as `RTSP_EXTERNAL_HOST` and sent to the NAT server on connection via `stream_info`.
+
+### Recording
+
+Streams can be automatically recorded when glasses connect. Controlled via `config/config.yaml`:
+
+```yaml
+recording:
+  enabled: true           # record streams when active
+  format: fmp4            # fmp4 | mpegts
+  segment_duration: 60m   # segment duration
+  path: "./recordings"    # host-side storage path
+```
+
+Recordings are stored at `./recordings/<stream_name>/<timestamp>.mp4` and are gitignored.
 
 ## Glasses Setup
 
@@ -116,6 +149,42 @@ When running, Docker Compose manages these containers:
 | Dashboard | 5001 | Web UI |
 | TTS Pusher | 5100 | TTS synthesis routing |
 | TTS Mixer | 5004 | RTSP audio publisher |
+
+## NAT WebSocket Protocol
+
+The runtime connects to the NAT agent server over WebSocket. All messages are JSON with a `type` field. The canonical type definitions live in `xr_runtime/voice_bridge/ws_protocol.py`.
+
+**Connection**: `ws://<nat-host>:8002/ws?session_id=<id>`
+
+### Runtime -> NAT
+
+| Type | When | Key Fields |
+|---|---|---|
+| `stream_info` | On connect | `camera_index`, `rtsp_base` (e.g. `rtsp://100.93.x.x:8554`), `paths` (`{video, audio, merged}`) |
+| `user_message` | User speaks (wake word stripped) | `text` |
+| `frame_response` | Reply to `request_frames` | `request_id`, `frames` (base64 JPEG list) |
+| `audio_stream` | Optional raw audio forwarding | `data` (base64 PCM), `sample_rate`, `seq` |
+| `video_stream` | Optional WS frame push | `data` (base64 JPEG), `width`, `height`, `seq` |
+| `ping` | Keepalive | -- |
+
+### NAT -> Runtime
+
+| Type | Purpose | Key Fields |
+|---|---|---|
+| `agent_response` | Agent reply, optional TTS | `text`, `tts` (bool) |
+| `notification` | System notification, optional TTS | `text`, `tts` (bool) |
+| `display_update` | Push to glasses display | `message_type` (`GENERIC` / `SINGLE_STEP_PANEL_CONTENT` / `COMPONENTS_STATUS`), `payload` (JSON string) |
+| `request_frames` | Capture camera frames | `request_id`, `count`, `interval_ms` |
+| `tts_only` | Speak without display | `text`, `priority` (`normal` / `high`) |
+| `wake_timeout` | Override wake word timeout | `seconds` |
+| `pong` | Keepalive reply | -- |
+
+### Consuming RTSP from the NAT server
+
+1. On WebSocket connect, listen for the `stream_info` message
+2. Build RTSP URLs: `{rtsp_base}/{paths.merged}` (e.g. `rtsp://100.93.211.91:8554/NB_0001_TX_CAM_RGB_MIC_p6S`)
+3. Open with any RTSP client (OpenCV `cv2.VideoCapture`, `ffmpeg`, GStreamer)
+4. Video-only and audio-only streams are available via `paths.video` and `paths.audio`
 
 ## Logs
 

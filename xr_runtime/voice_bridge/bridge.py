@@ -1,7 +1,12 @@
 """Voice Bridge -- per-camera service connecting audio hardware to the NAT agent.
 
-Main loop: MediaMTX audio -> FFmpeg decode -> STT -> wake word -> WebSocket to NAT.
+Main loop: MediaMTX audio -> FFmpeg decode -> STT -> accumulator -> wake word -> WebSocket to NAT.
 Return path: NAT responses -> TTS Pusher / Dashboard.
+
+Features:
+  - Utterance accumulation: debounces short ASR fragments before processing
+  - TTS barge-in: wake word or stop command interrupts TTS playback
+  - Optional continuous video frame streaming to the NAT server
 
 Message types sent to glasses:
   GENERIC              -- rich-text chat (user and agent messages)
@@ -18,6 +23,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from typing import Any, Dict, Optional
 
 from loguru import logger
@@ -43,13 +49,20 @@ MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 STT_HOST = os.environ.get("STT_HOST", "localhost")
 STT_PORT = int(os.environ.get("STT_PORT", "50051"))
 STT_PROTOCOL = os.environ.get("STT_PROTOCOL", "grpc")
+STT_MODEL = os.environ.get("STT_MODEL", "")
 TTS_PUSHER_URL = os.environ.get("TTS_PUSHER_URL", "http://tts-pusher:5000")
 DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://dashboard:5000")
 SOCKET_PATH = os.environ.get("SOCKET_PATH", "/tmp/xr_service.sock")
 FORWARD_AUDIO = os.environ.get("FORWARD_AUDIO", "false").lower() in ("true", "1", "yes")
+FORWARD_FRAMES = os.environ.get("FORWARD_FRAMES", "false").lower() in ("true", "1", "yes")
+FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", "640"))
+FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", "480"))
+FRAME_FPS = int(os.environ.get("FRAME_FPS", "15"))
 WAKE_WORDS = os.environ.get("WAKE_WORDS", "stella,hey stella").split(",")
 WAKE_TIMEOUT = float(os.environ.get("WAKE_TIMEOUT", "10"))
 TTS_MODEL = os.environ.get("TTS_MODEL", "vibevoice")
+RESET_SESSION = os.environ.get("RESET_SESSION_ON_DISCONNECT", "false").lower()
+RTSP_EXTERNAL_HOST = os.environ.get("RTSP_EXTERNAL_HOST", "localhost")
 
 AUDIO_CHUNK_MS = 100
 SAMPLE_RATE = 16000
@@ -58,6 +71,15 @@ CHUNK_SIZE = int(SAMPLE_RATE * (AUDIO_CHUNK_MS / 1000.0) * BYTES_PER_SAMPLE)
 
 _xr_conn = None
 _status: Optional[StatusManager] = None
+_tts_playing = False
+_tts_cancel = asyncio.Event()
+
+# Filler words / echo artefacts that ASR hallucinates from silence/noise
+_NOISE_TRANSCRIPTIONS = frozenset({
+    "mhm", "mm", "mmm", "hmm", "hm", "uh", "um", "ah", "oh",
+    "uh-huh", "mm-hmm", "mhm mhm", "so so",
+    "he", "ha", "hey", "hi",
+})
 
 
 def _get_xr_connection():
@@ -71,6 +93,70 @@ def _get_xr_connection():
         except Exception as exc:
             logger.warning(f"[Bridge] XR service connection failed: {exc}")
     return _xr_conn
+
+
+# ---------------------------------------------------------------------------
+# Utterance accumulator -- debounce short ASR fragments
+# ---------------------------------------------------------------------------
+
+class UtteranceAccumulator:
+    """Buffers short STT fragments and flushes after a silence gap.
+
+    Short fragments (single word or < MIN_CHARS) are held in the buffer.
+    Longer fragments cause an immediate flush (with any buffered prefix prepended).
+    A background task flushes the buffer after DEBOUNCE_SECONDS of inactivity.
+    """
+
+    MIN_CHARS = 4
+    DEBOUNCE_SECONDS = 0.4
+
+    def __init__(self):
+        self._buffer: list[str] = []
+        self._result_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._timer_handle: Optional[asyncio.TimerHandle] = None
+
+    def feed(self, text: str) -> None:
+        """Add a transcription fragment."""
+        text = text.strip()
+        if not text:
+            return
+
+        word_count = len(text.split())
+        is_short = word_count <= 1 or len(text) < self.MIN_CHARS
+
+        if is_short:
+            self._buffer.append(text)
+            self._reset_timer()
+        else:
+            self._buffer.append(text)
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._cancel_timer():
+            pass
+        if self._buffer:
+            merged = " ".join(self._buffer)
+            self._buffer.clear()
+            self._result_queue.put_nowait(merged)
+
+    def _reset_timer(self) -> None:
+        self._cancel_timer()
+        loop = asyncio.get_event_loop()
+        self._timer_handle = loop.call_later(self.DEBOUNCE_SECONDS, self._flush)
+
+    def _cancel_timer(self) -> bool:
+        if self._timer_handle is not None:
+            self._timer_handle.cancel()
+            self._timer_handle = None
+            return True
+        return False
+
+    def get(self) -> Optional[str]:
+        """Return the next accumulated utterance, or None."""
+        try:
+            return self._result_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -207,16 +293,122 @@ async def handle_wake_timeout(msg: dict, ww_filter: WakeWordFilter):
     logger.info(f"[Bridge] Wake timeout updated to {seconds}s")
 
 
+# ---------------------------------------------------------------------------
+# TTS with barge-in support
+# ---------------------------------------------------------------------------
+
 async def _trigger_tts(text: str):
+    """Synthesize TTS audio and deliver it to the glasses via the gRPC server.
+
+    Supports barge-in: checks ``_tts_cancel`` between audio chunks.
+    If the event is set (by the main loop detecting a wake word or stop command),
+    playback stops immediately.
+    """
+    global _tts_playing
+    logger.info(f"[TTS] Speaking: {text[:80]}")
     import httpx
+    import io
+    import wave
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"{TTS_PUSHER_URL}/synthesize",
-                json={"text": text, "model": TTS_MODEL, "index": CAMERA_INDEX},
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{TTS_PUSHER_URL}/synthesize_wav",
+                json={"text": text, "model": TTS_MODEL},
             )
+            resp.raise_for_status()
+            wav_bytes = resp.content
     except Exception as exc:
-        logger.warning(f"[Bridge] TTS trigger failed: {exc}")
+        logger.warning(f"[Bridge] TTS synthesis failed: {exc}")
+        return
+
+    conn = _get_xr_connection()
+    if conn is None:
+        logger.warning("[Bridge] No XR connection for TTS audio delivery")
+        return
+
+    _tts_cancel.clear()
+    _tts_playing = True
+    try:
+        from xr_service_library.xr_types import AudioSample
+
+        buf = io.BytesIO(wav_bytes)
+        with wave.open(buf, "rb") as wf:
+            sr = wf.getframerate()
+            sw = wf.getsampwidth()
+            ch = wf.getnchannels()
+            pcm = wf.readframes(wf.getnframes())
+
+        chunk_duration_ms = 100
+        bytes_per_frame = sw * ch
+        chunk_frames = int(sr * chunk_duration_ms / 1000)
+        chunk_bytes = chunk_frames * bytes_per_frame
+
+        sent = 0
+        for i in range(0, len(pcm), chunk_bytes):
+            if _tts_cancel.is_set():
+                logger.info(f"[TTS] Barge-in: stopped after {sent / bytes_per_frame / sr:.1f}s")
+                break
+
+            chunk = pcm[i : i + chunk_bytes]
+            sample = AudioSample(audio_data=chunk, sample_rate=float(sr))
+            conn.schedule_audio_transmission(sample)
+            sent += len(chunk)
+            await asyncio.sleep(chunk_duration_ms / 1000.0)
+        else:
+            logger.info(f"[TTS] Delivered {sent} bytes ({sent / bytes_per_frame / sr:.1f}s) to glasses")
+    except Exception as exc:
+        logger.warning(f"[Bridge] TTS audio delivery failed: {exc}")
+    finally:
+        await asyncio.sleep(0.3)
+        _tts_playing = False
+
+
+# ---------------------------------------------------------------------------
+# Continuous video frame streaming
+# ---------------------------------------------------------------------------
+
+async def _frame_stream_task(ws_client: NATWebSocketClient):
+    """Background task: captures frames from XR service and pushes them over WS."""
+    interval = 1.0 / max(1, FRAME_FPS)
+    seq = 0
+    logger.info(f"[Frames] Streaming at {FRAME_FPS} fps, {FRAME_WIDTH}x{FRAME_HEIGHT}")
+
+    while True:
+        try:
+            conn = _get_xr_connection()
+            if conn is None:
+                await asyncio.sleep(1.0)
+                continue
+
+            frame = conn.get_latest_frame()
+            if frame is None:
+                await asyncio.sleep(interval)
+                continue
+
+            import cv2
+            h, w = frame.shape[:2]
+            if w != FRAME_WIDTH or h != FRAME_HEIGHT:
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+            _, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            b64 = base64.b64encode(jpeg_buf.tobytes()).decode("ascii")
+            seq += 1
+
+            await ws_client.send({
+                "type": "video_stream",
+                "data": b64,
+                "width": FRAME_WIDTH,
+                "height": FRAME_HEIGHT,
+                "seq": seq,
+            })
+
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning(f"[Frames] Error: {exc}")
+            await asyncio.sleep(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +420,12 @@ async def main():
 
     logger.info(f"[Bridge] Starting for camera {CAMERA_INDEX}, session {SESSION_ID}")
 
+    # Log RTSP URLs for external access (VLC, NAT server, etc.)
+    idx = f"{CAMERA_INDEX:04d}"
+    logger.info(f"[RTSP] Video : rtsp://{RTSP_EXTERNAL_HOST}:8554/NB_{idx}_TX_CAM_RGB")
+    logger.info(f"[RTSP] Audio : rtsp://{RTSP_EXTERNAL_HOST}:8554/NB_{idx}_TX_MIC_p6S")
+    logger.info(f"[RTSP] Merged: rtsp://{RTSP_EXTERNAL_HOST}:8554/NB_{idx}_TX_CAM_RGB_MIC_p6S")
+
     _status = StatusManager(DASHBOARD_URL)
 
     ww_filter = WakeWordFilter(
@@ -235,17 +433,20 @@ async def main():
         timeout_seconds=WAKE_TIMEOUT,
     )
 
+    accumulator = UtteranceAccumulator()
+
     stt = create_stt_client({
         "host": STT_HOST,
         "port": STT_PORT,
         "protocol": STT_PROTOCOL,
+        "model": STT_MODEL,
     })
 
     ws_client = NATWebSocketClient(
         url=NAT_SERVER_URL,
         session_id=SESSION_ID,
         camera_index=CAMERA_INDEX,
-        rtsp_base=f"rtsp://{MEDIAMTX_HOST}:8554",
+        rtsp_base=f"rtsp://{RTSP_EXTERNAL_HOST}:8554",
         on_connect=lambda: asyncio.ensure_future(_status.update(server_connection="active")),
         on_disconnect=lambda: asyncio.ensure_future(_status.update(server_connection="inactive")),
     )
@@ -259,14 +460,21 @@ async def main():
 
     ws_task = asyncio.create_task(ws_client.run())
 
+    frame_task = None
+    if FORWARD_FRAMES:
+        frame_task = asyncio.create_task(_frame_stream_task(ws_client))
+
     await _status.update(voice_assistant="idle", server_connection="inactive")
 
     await stt.start_stream()
 
     audio_seq = 0
     ffmpeg_proc = None
-    _retry_delay = 2.0
+    _retry_delay = 0.05
     prev_ww_state = "IDLE"
+    _consecutive_failures = 0
+    _glasses_connected = False
+    _disconnect_handled = False
 
     try:
         while True:
@@ -274,9 +482,28 @@ async def main():
                 if ffmpeg_proc is not None:
                     ffmpeg_proc.stdout.close()
                     ffmpeg_proc.stderr.close()
-                logger.info(f"[Bridge] (Re)starting audio decoder in {_retry_delay:.0f}s")
+                    _consecutive_failures += 1
+                else:
+                    _consecutive_failures = 0
+
+                if _consecutive_failures >= 3 and _glasses_connected and not _disconnect_handled:
+                    _glasses_connected = False
+                    _disconnect_handled = True
+                    logger.info("[Session] Glasses disconnected. Awaiting reset decision...")
+
+                    if RESET_SESSION == "true":
+                        logger.info("[Session] Auto-resetting session (reset_on_disconnect=true)")
+                        await ws_client.reset_session()
+                        await _status.update(
+                            voice_assistant="idle",
+                            server_connection="inactive",
+                            robot_status="N/A",
+                        )
+                    elif RESET_SESSION == "ask":
+                        logger.info("[Session] Glasses disconnected. Awaiting reset decision...")
+
                 await asyncio.sleep(_retry_delay)
-                _retry_delay = min(_retry_delay * 1.5, 30.0)
+                _retry_delay = min(_retry_delay * 2, 0.5)
                 ffmpeg_proc = start_audio_decoder()
 
             chunk = await asyncio.get_event_loop().run_in_executor(
@@ -287,22 +514,51 @@ async def main():
                 ffmpeg_proc = None
                 continue
 
-            _retry_delay = 2.0
+            _retry_delay = 0.05
+            _consecutive_failures = 0
+
+            if not _glasses_connected:
+                _glasses_connected = True
+                _disconnect_handled = False
+                logger.info("[Bridge] Audio stream active")
 
             await stt.send_audio(chunk)
 
+            # -- STT result handling ----------------------------------------
             transcription = await stt.get_transcription()
             if transcription:
-                cleaned = ww_filter.process(transcription)
+                stripped = transcription.strip().lower()
 
-                # Track wake word state changes -> COMPONENTS_STATUS
+                # During TTS: only react to wake words and stop commands
+                if _tts_playing:
+                    if ww_filter.contains_wake_word(transcription) or WakeWordFilter.is_stop_command(transcription):
+                        logger.info(f"[STT] Barge-in detected: {transcription}")
+                        _tts_cancel.set()
+                    else:
+                        logger.debug(f"[STT] Suppressed (TTS playing): {transcription}")
+                    continue
+
+                if stripped in _NOISE_TRANSCRIPTIONS:
+                    logger.debug(f"[STT] Filtered noise: {transcription}")
+                    continue
+
+                accumulator.feed(transcription)
+
+            # -- Process accumulated utterances ------------------------------
+            utterance = accumulator.get()
+            if utterance:
+                logger.info(f"[STT] {utterance}")
+                cleaned = ww_filter.process(utterance)
+
                 cur_state = ww_filter.state
                 if cur_state != prev_ww_state:
                     va = "listening" if cur_state == "ACTIVE" else "idle"
+                    logger.info(f"[WakeWord] State: {prev_ww_state} -> {cur_state}")
                     await _status.update(voice_assistant=va)
                     prev_ww_state = cur_state
 
                 if cleaned:
+                    logger.info(f"[STT] -> NAT: {cleaned}")
                     await send_generic(cleaned, source="User")
                     await ws_client.send({
                         "type": "user_message",
@@ -325,6 +581,8 @@ async def main():
         await stt.stop_stream()
         await ws_client.stop()
         ws_task.cancel()
+        if frame_task:
+            frame_task.cancel()
         if ffmpeg_proc and ffmpeg_proc.poll() is None:
             ffmpeg_proc.terminate()
         logger.info("[Bridge] Shutdown complete")

@@ -247,15 +247,14 @@ class AudioPusher:
 
     def _push_manager(self):
         logger.info("Audio push manager started")
-        # allow longer silence before we kill ffmpeg; we keep ffmpeg alive and write silence
         stale_timeout_sec = 60.0
+        stale_backoff_sec = 5.0
         bytes_written_total = 0
         manager_start_time = time.time()
         while not self._stop_event.is_set():
             # Wait for sample_rate detection, but fallback to initial hint after 3s
             if self.sample_rate is None:
                 if time.time() - manager_start_time > 3.0:
-                    # fall back to initial hint
                     self.sample_rate = int(self.initial_sample_rate)
                     logger.warning(f"Falling back to initial sample_rate hint: {self.sample_rate} Hz")
                 else:
@@ -263,18 +262,16 @@ class AudioPusher:
                     continue
 
             if not self._has_recent_audio(recent_within_sec=1.0):
-                # No recent audio; keep ffmpeg alive and let writer inject silence
                 if not self.pushing:
-                    # start ffmpeg so it stays alive during silence
                     if not self._start_ffmpeg():
                         logger.warning("Failed to start ffmpeg for audio during silent state; retrying in 1s")
                         time.sleep(1.0)
                         continue
                     self.pushing = True
                     bytes_written_total = 0
-                # if pushing already, we will write silence in the writer loop
+                    with self._buffer_lock:
+                        self._last_received_time = time.time()
                 time.sleep(0.1)
-                # fall through to writer loop
 
             if not self.pushing:
                 if not self._start_ffmpeg():
@@ -283,6 +280,8 @@ class AudioPusher:
                     continue
                 self.pushing = True
                 bytes_written_total = 0
+                with self._buffer_lock:
+                    self._last_received_time = time.time()
 
             last_change_observed_time = time.time()
             last_chunk_len = 0
@@ -344,10 +343,10 @@ class AudioPusher:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-                # Stop only if we haven't received real audio for stale_timeout_sec
                 if (now - self._last_received_time) > stale_timeout_sec:
                     logger.info(f"Stopping audio push due to stale audio (no data for {stale_timeout_sec}s)")
                     self._stop_ffmpeg("stale audio")
+                    self._stop_event.wait(stale_backoff_sec)
                     break
 
         if self.pushing:

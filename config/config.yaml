@@ -11,7 +11,7 @@
 # Set this to the WebSocket URL of your NAT server.
 # ---------------------------------------------------------------------------
 nat_server:
-  url: "ws://localhost:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+  url: "ws://100.93.211.91:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
 
 # ---------------------------------------------------------------------------
 # XR Runtime -- streaming, video, gRPC
@@ -30,13 +30,14 @@ runtime:
 # ---------------------------------------------------------------------------
 speech:
   stt:
-    host: "localhost"                     # STT server hostname or IP
+    host: "100.93.211.91"                     # STT server hostname or IP
     port: 50051
-    protocol: grpc                        # grpc | http
+    protocol: grpc                        # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs
+    model: "parakeet-1.1b-en-US-asr-streaming"
 
   tts:
     enabled: true
-    provider: vibevoice                   # riva | qwen | vibevoice
+    provider: elevenlabs                  # riva | qwen | vibevoice | elevenlabs
     riva:
       host: riva-server
       port: 50051
@@ -44,8 +45,11 @@ speech:
       base_url: https://dashscope.aliyuncs.com/api/v1
       api_key_env: DASHSCOPE_API_KEY
     vibevoice:
-      host: "localhost"                   # TTS server hostname or IP
+      host: "100.93.211.91"                   # TTS server hostname or IP
       port: 8050
+    elevenlabs:
+      voice_id: "pNInz6obpgDQGcFmaJgB"       # Adam pre-made voice
+      model_id: "eleven_multilingual_v2"
 
 # ---------------------------------------------------------------------------
 # Dashboard -- local web UI
@@ -69,17 +73,48 @@ nvr:
     storage_size: 300000
 
 # ---------------------------------------------------------------------------
+# Video frame streaming (over NAT WebSocket)
+# ---------------------------------------------------------------------------
+frame_streaming:
+  enabled: false                          # set to true to push frames over WS
+  width: 640
+  height: 480
+  fps: 15
+
+# ---------------------------------------------------------------------------
+# RTSP external access
+# ---------------------------------------------------------------------------
+rtsp:
+  external_host: "auto"                   # "auto" detects Tailscale/LAN IP; or set a fixed IP
+
+# ---------------------------------------------------------------------------
+# Recording -- MediaMTX auto-records when glasses connect
+# ---------------------------------------------------------------------------
+recording:
+  enabled: true                           # record streams when active
+  format: fmp4                            # fmp4 | mpegts
+  segment_duration: 60m                   # segment duration (e.g., 60m, 1h)
+  path: "./recordings"                    # host-side path for recorded files
+
+# ---------------------------------------------------------------------------
 # Wake word settings (for voice bridge)
 # ---------------------------------------------------------------------------
 wakeword:
   words:
     - stella
     - hey stella
+    - hi stella
   timeout_seconds: 10
   sleep_commands:
     - thanks
     - goodbye
     - go to sleep
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+session:
+  reset_on_disconnect: ask    # true | false | ask
 
 # ---------------------------------------------------------------------------
 # Global settings

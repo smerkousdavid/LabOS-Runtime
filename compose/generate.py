@@ -30,6 +30,13 @@ def main():
     }
 
     nat_url = os.environ.get("NAT_SERVER_URL", "ws://localhost:8002/ws")
+    stt_host = os.environ.get("STT_HOST", "localhost")
+
+    # Inside Docker containers "localhost" refers to the container itself,
+    # not the host machine.  Rewrite to the Docker-provided alias so that
+    # services running on the host are reachable from inside containers.
+    def _docker_host(val: str) -> str:
+        return val.replace("localhost", "host.docker.internal").replace("127.0.0.1", "host.docker.internal")
 
     context = {
         "num_cameras": num_cameras,
@@ -40,15 +47,24 @@ def main():
         "rtsp_image": os.environ.get("RTSP_IMAGE", "labos_streaming:latest"),
         "ENABLE_TTS": os.environ.get("ENABLE_TTS", "false").lower() in ("1", "true", "yes"),
         "ENABLE_NVR": os.environ.get("ENABLE_NVR", "false").lower() in ("1", "true", "yes"),
-        "nat_server_url": nat_url,
-        "nat_ws_url": nat_url,
-        "stt_host": os.environ.get("STT_HOST", "localhost"),
+        "nat_server_url": _docker_host(nat_url),
+        "nat_ws_url": _docker_host(nat_url),
+        "stt_host": _docker_host(stt_host),
         "stt_port": os.environ.get("STT_PORT", "50051"),
         "stt_protocol": os.environ.get("STT_PROTOCOL", "grpc"),
+        "stt_model": os.environ.get("STT_MODEL", ""),
         "tts_pusher_url": "http://tts-pusher:5000",
         "dashboard_url": "http://dashboard:5000",
         "forward_audio": os.environ.get("FORWARD_AUDIO", "false"),
+        "forward_frames": os.environ.get("FORWARD_FRAMES", "false"),
+        "frame_width": os.environ.get("FRAME_WIDTH", "640"),
+        "frame_height": os.environ.get("FRAME_HEIGHT", "480"),
+        "frame_fps": os.environ.get("FRAME_FPS", "15"),
+        "rtsp_external_host": _docker_host(os.environ.get("RTSP_EXTERNAL_HOST", "localhost")),
         "tts_model": os.environ.get("TTS_PROVIDER", "vibevoice"),
+        "reset_session": os.environ.get("RESET_SESSION_ON_DISCONNECT", "false"),
+        "recording_enabled": os.environ.get("RECORDING_ENABLED", "false").lower() in ("1", "true", "yes"),
+        "recordings_path": os.environ.get("RECORDINGS_PATH", "./recordings"),
     }
 
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(os.path.dirname(__file__) or "."))

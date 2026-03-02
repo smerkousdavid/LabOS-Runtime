@@ -233,6 +233,69 @@ class VibevoiceProvider(TTSProvider):
         return self.config.get('voices', [])
 
 
+class ElevenlabsProvider(TTSProvider):
+    """ElevenLabs TTS Provider using the official SDK."""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        from elevenlabs.client import ElevenLabs
+
+        api_key = os.environ.get('ELEVENLABS_API_KEY') or config.get('api_key', '')
+        if not api_key:
+            raise ValueError("ELEVENLABS_API_KEY is required for ElevenLabs TTS")
+        self._client = ElevenLabs(api_key=api_key)
+        self._voice_id = config.get('default_voice', 'pNInz6obpgDQGcFmaJgB')
+        self._model_id = config.get('model_id', 'eleven_multilingual_v2')
+        self._output_format = config.get('output_format', 'mp3_22050_32')
+
+    def synthesize(self, text: str, voice: str = None, **kwargs) -> bytes:
+        from elevenlabs import VoiceSettings
+
+        voice_id = voice or self._voice_id
+        try:
+            response = self._client.text_to_speech.stream(
+                voice_id=voice_id,
+                output_format=self._output_format,
+                text=text,
+                model_id=self._model_id,
+                voice_settings=VoiceSettings(
+                    stability=0.0,
+                    similarity_boost=1.0,
+                    style=0.0,
+                    use_speaker_boost=True,
+                    speed=1.0,
+                ),
+            )
+
+            audio_stream = io.BytesIO()
+            for chunk in response:
+                if chunk:
+                    audio_stream.write(chunk)
+            audio_stream.seek(0)
+            mp3_bytes = audio_stream.read()
+
+            if not mp3_bytes:
+                raise ValueError("No audio data received from ElevenLabs")
+
+            wav_bytes = self._mp3_to_wav(mp3_bytes)
+            return self._normalize_audio_format(wav_bytes, target_sample_rate=48000, target_channels=1)
+        except Exception as e:
+            logger.error(f"ElevenLabs synthesis failed: {e}")
+            raise
+
+    def _mp3_to_wav(self, mp3_bytes: bytes) -> bytes:
+        """Convert MP3 bytes to WAV using ffmpeg."""
+        cmd = [
+            'ffmpeg', '-f', 'mp3', '-i', 'pipe:0',
+            '-f', 'wav', '-hide_banner', '-loglevel', 'error', 'pipe:1',
+        ]
+        proc = subprocess.run(cmd, input=mp3_bytes, capture_output=True, check=True, timeout=10)
+        return proc.stdout
+
+    def get_available_voices(self) -> List[Dict]:
+        return self.config.get('voices', [])
+
+
 class TTSProviderFactory:
     """Factory for creating TTS providers."""
 
@@ -246,6 +309,8 @@ class TTSProviderFactory:
             return RivaProvider(model_config)
         elif provider_name == 'vibevoice':
             return VibevoiceProvider(model_config)
+        elif provider_name == 'elevenlabs':
+            return ElevenlabsProvider(model_config)
         elif provider_type == 'http':
             return QwenProvider(model_config)
         else:

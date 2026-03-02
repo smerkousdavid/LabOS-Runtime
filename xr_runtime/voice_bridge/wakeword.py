@@ -16,6 +16,9 @@ class State(str, Enum):
     ACTIVE = "ACTIVE"
 
 
+_STOP_COMMANDS = frozenset({"stop", "quiet", "shut up", "be quiet", "stop talking"})
+
+
 class WakeWordFilter:
     def __init__(
         self,
@@ -43,6 +46,16 @@ class WakeWordFilter:
     def timeout_seconds(self, value: float):
         self._timeout = max(1.0, value)
 
+    def contains_wake_word(self, text: str) -> bool:
+        """Return True if *text* contains any wake word (anywhere, not just prefix)."""
+        t = text.lower()
+        return any(ww in t for ww in self._wake_words)
+
+    @staticmethod
+    def is_stop_command(text: str) -> bool:
+        """Return True if *text* is a TTS stop/interrupt command."""
+        return text.strip().lower().rstrip(".!") in _STOP_COMMANDS
+
     def process(self, transcription: str) -> Optional[str]:
         """Process a transcription. Returns cleaned text if active, None if filtered.
 
@@ -56,8 +69,9 @@ class WakeWordFilter:
 
         text_lower = text.lower()
 
-        # Check for wake word activation
-        for ww in self._wake_words:
+        # Check for wake word activation (longest match first to prefer
+        # "hey stella" over "stella" when both are configured)
+        for ww in sorted(self._wake_words, key=len, reverse=True):
             if text_lower.startswith(ww):
                 self._activate()
                 cleaned = text[len(ww):].strip()

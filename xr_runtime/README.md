@@ -110,6 +110,40 @@ The `xr_service_library` Python package (installed from `.whl`) provides `XRServ
 
 ---
 
+## Session Lifecycle
+
+A **session** is the WebSocket connection between the voice bridge and the NAT server. Closing the WebSocket connection resets the session -- the NAT server treats a new connection as a fresh conversation.
+
+### Glasses Connect
+
+When XR glasses connect to the gRPC server and audio starts flowing, the voice bridge:
+
+1. Sends an initial `COMPONENTS_STATUS` message to the glasses: `voice_assistant=idle`, `server_connection=inactive`, `robot_status=N/A`
+2. Starts the STT pipeline and wake word filter
+3. Establishes (or re-uses) the WebSocket session with the NAT server
+
+### Glasses Disconnect
+
+When the audio stream stops (FFmpeg decoder fails 3+ consecutive times), the voice bridge treats this as a glasses disconnect.
+
+The behavior is controlled by `session.reset_on_disconnect` in `config/config.yaml`:
+
+| Value | Behavior |
+|-------|----------|
+| `true` | Automatically close the NAT WebSocket (reset session) and reset status to idle/inactive/N/A. The auto-reconnect logic will create a fresh session. |
+| `false` | Do nothing special; keep retrying audio and preserve the existing session. |
+| `ask` | Log the disconnect event. The launcher terminal prompts the user: "Reset session? [y/N]". If confirmed, the voice bridge container is restarted, which closes the WS and creates a fresh session. |
+
+```yaml
+# config/config.yaml
+session:
+  reset_on_disconnect: ask    # true | false | ask
+```
+
+This maps to the `RESET_SESSION_ON_DISCONNECT` environment variable in the voice bridge container.
+
+---
+
 ## Module Index
 
 | Module | README | Description |

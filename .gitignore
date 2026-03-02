@@ -9,6 +9,9 @@ compose.yaml
 # Runtime logs
 logs/
 
+# Recordings
+recordings/
+
 # Python
 __pycache__/
 *.pyc

@@ -162,9 +162,124 @@ This only happens in video Mode 1 (WebSocket). In Modes 2/3, the NAT server read
 | `DASHBOARD_URL` | yes | Dashboard base URL (e.g., `http://dashboard:5000`) |
 | `SOCKET_PATH` | no | XR socket path (default: `/tmp/xr_service.sock`) |
 | `FORWARD_AUDIO` | no | `true` to forward raw audio to NAT (default: `false`) |
+| `FORWARD_FRAMES` | no | `true` to push JPEG frames over WebSocket (default: `false`) |
+| `FRAME_WIDTH` | no | Frame width for WS push (default: `640`) |
+| `FRAME_HEIGHT` | no | Frame height for WS push (default: `480`) |
+| `FRAME_FPS` | no | Frame rate for WS push (default: `15`) |
+| `RTSP_EXTERNAL_HOST` | no | IP/host for RTSP URLs sent to NAT (auto-detected at configure time) |
 | `WAKE_WORDS` | no | Comma-separated wake words (default: `stella,hey stella`) |
 | `WAKE_TIMEOUT` | no | Wake word timeout seconds (default: `10`) |
 | `LOGURU_LEVEL` | no | Log level (default: `INFO`) |
+
+---
+
+## NAT WebSocket Protocol Reference
+
+The full protocol is defined in `ws_protocol.py`. All messages are JSON objects with a required `type` field.
+
+**Connection URL**: `ws://<nat-host>:8002/ws?session_id=<id>`
+
+### Runtime -> NAT (inbound to NAT)
+
+**`stream_info`** -- Sent immediately on connect. Provides the RTSP base URL and stream path names so the NAT server can access live audio/video.
+
+```json
+{
+  "type": "stream_info",
+  "camera_index": 1,
+  "rtsp_base": "rtsp://100.93.211.91:8554",
+  "paths": {
+    "video": "NB_0001_TX_CAM_RGB",
+    "audio": "NB_0001_TX_MIC_p6S",
+    "merged": "NB_0001_TX_CAM_RGB_MIC_p6S"
+  }
+}
+```
+
+To build a full RTSP URL: `{rtsp_base}/{paths.merged}` -> `rtsp://100.93.211.91:8554/NB_0001_TX_CAM_RGB_MIC_p6S`
+
+**`user_message`** -- Transcribed user speech with the wake word stripped. Only sent when the wake word filter is active.
+
+```json
+{"type": "user_message", "text": "list some protocols"}
+```
+
+**`frame_response`** -- Reply to `request_frames`. Contains base64-encoded JPEG frames.
+
+```json
+{"type": "frame_response", "request_id": "abc-123", "frames": ["<base64>", ...]}
+```
+
+**`audio_stream`** (optional) -- Raw audio chunks when `FORWARD_AUDIO=true`.
+
+```json
+{"type": "audio_stream", "data": "<base64 PCM>", "sample_rate": 16000, "seq": 42}
+```
+
+**`video_stream`** (optional) -- JPEG video frames when `FORWARD_FRAMES=true`.
+
+```json
+{"type": "video_stream", "data": "<base64 JPEG>", "width": 640, "height": 480, "seq": 42}
+```
+
+**`ping`** -- Keepalive. NAT should reply with `pong`.
+
+### NAT -> Runtime (outbound from NAT)
+
+**`agent_response`** -- Agent reply text. When `tts` is `true`, the runtime speaks it through the glasses.
+
+```json
+{"type": "agent_response", "text": "Here are three protocols...", "tts": true}
+```
+
+**`notification`** -- System notification. When `tts` is `true`, spoken aloud.
+
+```json
+{"type": "notification", "text": "Connection established", "tts": true}
+```
+
+**`display_update`** -- Push content to the glasses display panels.
+
+```json
+{
+  "type": "display_update",
+  "message_type": "COMPONENTS_STATUS",
+  "payload": "{\"Voice_Assistant\": \"listening\", \"Server_Connection\": \"active\"}"
+}
+```
+
+Valid `message_type` values: `GENERIC`, `SINGLE_STEP_PANEL_CONTENT`, `COMPONENTS_STATUS`.
+
+**`request_frames`** -- Ask the runtime to capture camera frames and send back a `frame_response`.
+
+```json
+{"type": "request_frames", "request_id": "abc-123", "count": 8, "interval_ms": 1250}
+```
+
+**`tts_only`** -- Speak text without displaying it on the glasses.
+
+```json
+{"type": "tts_only", "text": "Processing your request", "priority": "normal"}
+```
+
+**`wake_timeout`** -- Override the wake word auto-deactivation timer.
+
+```json
+{"type": "wake_timeout", "seconds": 30}
+```
+
+**`pong`** -- Keepalive reply to `ping`.
+
+### RTSP Stream Access
+
+The preferred way for the NAT server to consume video/audio is via RTSP. On WebSocket connect:
+
+1. Receive the `stream_info` message
+2. Build full RTSP URL: `{rtsp_base}/{paths.merged}` (e.g. `rtsp://100.93.211.91:8554/NB_0001_TX_CAM_RGB_MIC_p6S`)
+3. Open with any RTSP client (OpenCV, ffmpeg, GStreamer)
+4. Individual video-only (`paths.video`) and audio-only (`paths.audio`) streams are also available
+
+The `rtsp_base` host is auto-detected at configure time to be reachable from the NAT server's network (Tailscale-aware).
 
 ---
 
