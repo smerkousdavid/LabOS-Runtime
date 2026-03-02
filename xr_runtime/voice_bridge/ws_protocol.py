@@ -90,14 +90,21 @@ class Pong(TypedDict):
     type: Literal["pong"]
 
 
+class ToolCall(TypedDict):
+    type: Literal["tool_call"]
+    tool_name: str
+    summary: str
+    status: str  # "started" | "completed" | "failed"
+
+
 # ---- Type unions for dispatch ------------------------------------------------
 
 InboundMessage = UserMessage | FrameResponse | AudioStream | VideoStream | StreamInfo | Ping
-OutboundMessage = AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly | WakeTimeout | Pong
+OutboundMessage = AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly | WakeTimeout | Pong | ToolCall
 
 # All valid type strings
 INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "video_stream", "stream_info", "ping"}
-OUTBOUND_TYPES = {"agent_response", "notification", "display_update", "request_frames", "tts_only", "wake_timeout", "pong"}
+OUTBOUND_TYPES = {"agent_response", "notification", "display_update", "request_frames", "tts_only", "wake_timeout", "pong", "tool_call"}
 
 
 # ---- Helpers -----------------------------------------------------------------
@@ -144,3 +151,7 @@ def make_tts_only(text: str, priority: str = "normal") -> TtsOnly:
 
 def make_wake_timeout(seconds: int) -> WakeTimeout:
     return {"type": "wake_timeout", "seconds": seconds}
+
+
+def make_tool_call(tool_name: str, summary: str, status: str) -> ToolCall:
+    return {"type": "tool_call", "tool_name": tool_name, "summary": summary, "status": status}

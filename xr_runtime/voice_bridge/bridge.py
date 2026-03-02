@@ -287,6 +287,22 @@ async def handle_request_frames(msg: dict, ws_client: NATWebSocketClient):
     })
 
 
+async def handle_tool_call(msg: dict):
+    """Display tool call activity as a GENERIC chat message on the glasses."""
+    tool_name = msg.get("tool_name", "unknown")
+    summary = msg.get("summary", "")
+    status = msg.get("status", "started")
+
+    if status == "started":
+        text = f"<color=#59D2FF>Tool: {tool_name}</color> -- {summary}"
+    elif status == "completed":
+        text = f"<color=#88CC88>Tool: {tool_name}</color> -- done"
+    else:
+        text = f"<color=#FF4444>Tool: {tool_name}</color> -- {status}"
+
+    await send_generic(text, source="Tool")
+
+
 async def handle_wake_timeout(msg: dict, ww_filter: WakeWordFilter):
     seconds = msg.get("seconds", 10)
     ww_filter.timeout_seconds = float(seconds)
@@ -455,6 +471,7 @@ async def main():
     ws_client.on("notification", handle_notification)
     ws_client.on("display_update", handle_display_update)
     ws_client.on("tts_only", handle_tts_only)
+    ws_client.on("tool_call", handle_tool_call)
     ws_client.on("request_frames", lambda msg: handle_request_frames(msg, ws_client))
     ws_client.on("wake_timeout", lambda msg: handle_wake_timeout(msg, ww_filter))
 
