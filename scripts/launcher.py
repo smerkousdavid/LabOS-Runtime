@@ -328,16 +328,18 @@ def main():
     if args.no_nvr:
         os.environ["ENABLE_NVR"] = "false"
 
-    # ── Build streaming image if needed ───────────────────────────────────
+    # ── Stop any running containers first ─────────────────────────────────
     running = count_running_containers()
-    if running == 0 or args.rebuild:
-        console.print("Building Docker images ...")
-        streaming_df = ROOT / "xr_runtime" / "streaming" / "Dockerfile"
-        if streaming_df.exists():
-            run(["docker", "build", "-f", str(streaming_df), "-t", "labos_streaming:latest",
-                 str(ROOT / "xr_runtime")])
-    else:
-        console.print(f"[dim]{running} containers already running, skipping image build[/dim]")
+    if running > 0:
+        console.print(f"[dim]Stopping {running} running container(s) ...[/dim]")
+        docker_compose_down()
+
+    # ── Build streaming image ──────────────────────────────────────────────
+    console.print("Building Docker images ...")
+    streaming_df = ROOT / "xr_runtime" / "streaming" / "Dockerfile"
+    if streaming_df.exists():
+        run(["docker", "build", "-f", str(streaming_df), "-t", "labos_streaming:latest",
+             str(ROOT / "xr_runtime")])
 
     # ── Create log directories ────────────────────────────────────────────
     create_log_dirs(num_cameras)
@@ -352,7 +354,7 @@ def main():
 
     # ── Start services ────────────────────────────────────────────────────
     console.print("Starting services ...")
-    docker_compose_up(rebuild=args.rebuild)
+    docker_compose_up(rebuild=True)
 
     # ── Wait for readiness ────────────────────────────────────────────────
     console.print()

@@ -11,7 +11,7 @@
 # Set this to the WebSocket URL of your NAT server.
 # ---------------------------------------------------------------------------
 nat_server:
-  url: "ws://100.93.211.91:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+  url: "ws://labos-nat:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
 
 # ---------------------------------------------------------------------------
 # XR Runtime -- streaming, video, gRPC
@@ -30,7 +30,7 @@ runtime:
 # ---------------------------------------------------------------------------
 speech:
   stt:
-    host: "100.93.211.91"                     # STT server hostname or IP
+    host: "labos-nat"                     # STT server hostname or IP
     port: 50051
     protocol: grpc                        # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs
     model: "parakeet-1.1b-en-US-asr-streaming"
@@ -45,7 +45,7 @@ speech:
       base_url: https://dashscope.aliyuncs.com/api/v1
       api_key_env: DASHSCOPE_API_KEY
     vibevoice:
-      host: "100.93.211.91"                   # TTS server hostname or IP
+      host: "labos-nat"                   # TTS server hostname or IP
       port: 8050
     elevenlabs:
       voice_id: "pNInz6obpgDQGcFmaJgB"       # Adam pre-made voice

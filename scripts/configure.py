@@ -22,6 +22,45 @@ CONFIG_FILE = ROOT / "config" / "config.yaml"
 
 
 # ---------------------------------------------------------------------------
+# Hostname resolution (so Docker containers always get IPs they can reach)
+# ---------------------------------------------------------------------------
+
+def resolve_host(hostname: str) -> str:
+    """Resolve a hostname to an IPv4 address.
+
+    Returns the original string unchanged if it's already an IP or resolution
+    fails (so the rest of the pipeline keeps working with the raw value).
+    """
+    if not hostname or hostname in ("localhost", "127.0.0.1", "0.0.0.0"):
+        return hostname
+    try:
+        socket.inet_aton(hostname)
+        return hostname
+    except OSError:
+        pass
+    try:
+        info = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        if info:
+            ip = info[0][4][0]
+            print(f"  Resolved {hostname} -> {ip}")
+            return ip
+    except socket.gaierror:
+        pass
+    return hostname
+
+
+def resolve_url(url: str) -> str:
+    """Replace the hostname inside a URL with its resolved IP."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return url
+    resolved = resolve_host(parsed.hostname)
+    if resolved == parsed.hostname:
+        return url
+    return parsed._replace(netloc=parsed.netloc.replace(parsed.hostname, resolved, 1)).geturl()
+
+
+# ---------------------------------------------------------------------------
 # Secrets loader
 # ---------------------------------------------------------------------------
 
@@ -104,7 +143,10 @@ def generate_env(cfg: dict, secrets: dict) -> str:
     shinobi = nvr.get("shinobi", {})
 
     session = cfg.get("session", {})
-    nat_url = nat.get("url", "ws://localhost:8002/ws")
+    nat_url = resolve_url(nat.get("url", "ws://localhost:8002/ws"))
+
+    # Resolve STT host so Docker containers can always reach it
+    stt_host = resolve_host(stt.get("host", "localhost"))
 
     # Resolve RTSP external host
     _rtsp_host_raw = cfg.get("rtsp", {}).get("external_host", "auto")
@@ -150,7 +192,7 @@ def generate_env(cfg: dict, secrets: dict) -> str:
         f"NAT_SERVER_URL={nat_url}",
         "",
         "# Speech",
-        f"STT_HOST={stt.get('host', 'localhost')}",
+        f"STT_HOST={stt_host}",
         f"STT_PORT={stt.get('port', 50051)}",
         f"STT_PROTOCOL={stt.get('protocol', 'grpc')}",
         f"STT_MODEL={stt.get('model', '')}",

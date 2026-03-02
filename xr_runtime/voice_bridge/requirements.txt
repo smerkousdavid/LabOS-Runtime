@@ -5,3 +5,4 @@ grpcio>=1.60.0
 nvidia-riva-client>=2.17.0
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
+pyyaml>=6.0

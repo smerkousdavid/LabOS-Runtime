@@ -187,9 +187,14 @@ cp /path/to/env.secrets config/.env.secrets
 run.bat               # Windows
 ```
 
-Wait for all Docker containers to build and start. This may take several minutes on the first run.
+Wait for all Docker containers to build and start. This may take several minutes on the first run. For now it might ask
+```txt
+Update glasses connection config? :
+```
+Please reply with `n` as auto updating glasses will not work currently.
 
-Once running, **open the LabCapture app** on the VITURE glasses. You should see the status indicators turn green and the assistant will greet you.
+
+Once running, **open the LabCapture app** on the VITURE glasses. You should see the status indicators turn green and the assistant will greet you. If the status indicator is not green, still try talking by saying "Hey Stella, how are you?" to see if it connects and runs.
 
 To stop the runtime:
 
