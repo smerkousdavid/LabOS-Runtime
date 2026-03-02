@@ -123,6 +123,30 @@ class NATWebSocketClient:
                 "merged": f"NB_{idx}_TX_CAM_RGB_MIC_p6S",
             },
         })
+        await self._send_local_protocols()
+
+    async def _send_local_protocols(self):
+        """Scan local protocols/ directory and push contents to NAT."""
+        from pathlib import Path
+
+        proto_dir = Path("protocols")
+        if not proto_dir.is_dir():
+            return
+
+        exts = {".txt", ".md", ".csv", ".json", ".yaml", ".yml"}
+        protocols = []
+        for f in sorted(proto_dir.iterdir()):
+            if f.is_file() and f.suffix.lower() in exts:
+                try:
+                    content = f.read_text(encoding="utf-8")
+                    if content.strip():
+                        protocols.append({"name": f.name, "content": content})
+                except Exception as exc:
+                    logger.warning(f"[WS Client] Failed to read protocol {f.name}: {exc}")
+
+        if protocols:
+            await self.send({"type": "protocol_push", "protocols": protocols})
+            logger.info(f"[WS Client] Pushed {len(protocols)} protocol(s) to NAT")
 
     async def _dispatch(self, msg: dict):
         msg_type = msg.get("type", "")

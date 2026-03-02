@@ -1,0 +1,17 @@
+suppressed_tools:
+  - list_protocols
+  - start_protocol
+  - stop_protocol
+  - next_step
+  - previous_step
+  - go_to_step
+  - restart_protocol
+  - clear_error
+  - get_protocol_status
+  - show_protocol_panel
+  - detailed_step
+  - get_errors
+  - show_experiment_data
+  - summarize_history
+  - get_datetime
+  - update_user

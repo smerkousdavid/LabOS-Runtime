@@ -123,6 +123,8 @@ services:
     volumes:
       - xr_socket_{{ i+1 }}:/tmp
       - ./logs/voice_bridge_{{ i+1 }}:/app/logs
+      - ./protocols:/app/protocols:ro
+      - ./xr_runtime/voice_bridge/tool_filter.yaml:/app/tool_filter.yaml:ro
     env_file: .env
     environment:
       - NAT_SERVER_URL={{ nat_server_url }}

@@ -38,6 +38,27 @@ from ws_client import NATWebSocketClient
 from status_manager import StatusManager
 
 
+def _load_tool_filter() -> set:
+    """Load suppressed tool names from tool_filter.yaml."""
+    import yaml
+    from pathlib import Path
+    for candidate in [Path("tool_filter.yaml"), Path(__file__).parent / "tool_filter.yaml"]:
+        if candidate.is_file():
+            try:
+                with open(candidate) as f:
+                    data = yaml.safe_load(f) or {}
+                names = set(data.get("suppressed_tools", []))
+                if names:
+                    logger.info(f"[Bridge] Loaded tool filter: {len(names)} suppressed tools")
+                return names
+            except Exception as exc:
+                logger.warning(f"[Bridge] Failed to load tool_filter.yaml: {exc}")
+    return set()
+
+
+_SUPPRESSED_TOOLS: set = _load_tool_filter()
+
+
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
@@ -291,6 +312,8 @@ async def handle_request_frames(msg: dict, ws_client: NATWebSocketClient):
 async def handle_tool_call(msg: dict):
     """Display tool call activity as a GENERIC chat message on the glasses."""
     tool_name = msg.get("tool_name", "unknown")
+    if tool_name in _SUPPRESSED_TOOLS:
+        return
     summary = msg.get("summary", "")
     status = msg.get("status", "started")
 

@@ -44,6 +44,11 @@ class StreamInfo(TypedDict):
     paths: Dict[str, str]  # {"video": "NB_0001_TX_CAM_RGB", "audio": "...", "merged": "..."}
 
 
+class ProtocolPush(TypedDict):
+    type: Literal["protocol_push"]
+    protocols: List[Dict[str, str]]  # [{"name": "...", "content": "..."}]
+
+
 class Ping(TypedDict):
     type: Literal["ping"]
 
@@ -99,11 +104,11 @@ class ToolCall(TypedDict):
 
 # ---- Type unions for dispatch ------------------------------------------------
 
-InboundMessage = UserMessage | FrameResponse | AudioStream | VideoStream | StreamInfo | Ping
+InboundMessage = UserMessage | FrameResponse | AudioStream | VideoStream | StreamInfo | ProtocolPush | Ping
 OutboundMessage = AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly | WakeTimeout | Pong | ToolCall
 
 # All valid type strings
-INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "video_stream", "stream_info", "ping"}
+INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "video_stream", "stream_info", "protocol_push", "ping"}
 OUTBOUND_TYPES = {"agent_response", "notification", "display_update", "request_frames", "tts_only", "wake_timeout", "pong", "tool_call"}
 
 
@@ -155,3 +160,7 @@ def make_wake_timeout(seconds: int) -> WakeTimeout:
 
 def make_tool_call(tool_name: str, summary: str, status: str) -> ToolCall:
     return {"type": "tool_call", "tool_name": tool_name, "summary": summary, "status": status}
+
+
+def make_protocol_push(protocols: List[Dict[str, str]]) -> ProtocolPush:
+    return {"type": "protocol_push", "protocols": protocols}

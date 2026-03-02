@@ -1,0 +1,87 @@
+<pcr_protocol>
+  <title>PCR for 5 DNA Fragments</title>
+  <goal>Amplify 5 fragments using primer pairs F1/R1, F2/R2, F3/R3, F4/R4, and F5/R5.</goal>
+
+  <materials>
+    <item>Micropipettes (P20, P200) and tips</item>
+    <item>5X QS buffer</item>
+    <item>5X G/C buffer</item>
+    <item>Forward primers and reverse primers</item>
+    <item>dNTPs</item>
+    <item>Q5Pol*HS</item>
+    <item>pDNA</item>
+    <item>dH2O</item>
+    <item>EDTA</item>
+    <item>5 PCR tubes (0.2 mL)</item>
+    <item>1 centrifuge tube (0.5 mL)</item>
+    <item>Centrifuge</item>
+    <item>Vortex</item>
+    <item>Analytical balance</item>
+    <item>Thermocycler</item>
+  </materials>
+
+  <reaction_mix_per_reaction>
+    <reagent name="5X QS buffer">5 uL</reagent>
+    <reagent name="5X G/C buffer">5 uL</reagent>
+    <reagent name="Forward Primer">0.5 uL</reagent>
+    <reagent name="Reverse Primer">0.5 uL</reagent>
+    <reagent name="dNTPs">0.5 uL</reagent>
+    <reagent name="Q5Pol*HS">0.25 uL</reagent>
+    <reagent name="pDNA">13.25 uL</reagent>
+    <reagent name="dH2O">as needed / source table lists total as 25 uL</reagent>
+    <total>25 uL</total>
+  </reaction_mix_per_reaction>
+
+  <protocol_steps>
+    <step id="1" title="Label tubes">
+      Label the five PCR tubes as F1/R1, F2/R2, F3/R3, F4/R4, and F5/R5, and label the 0.5 mL tube for the mix. Do this before adding any liquid so you do not mix up reactions later.
+    </step>
+
+    <step id="2" title="Weigh empty tubes">
+      Weigh all 5 empty PCR tubes and the empty 0.5 mL centrifuge tube, then record each value. Wait for the balance reading to stabilize before writing it down.
+    </step>
+
+    <step id="3" title="Set up reagents">
+      Gather all reagents and keep temperature-sensitive components cold if your lab normally does that. Briefly vortex and quick-spin reagents if needed so all liquid is at the bottom before pipetting.
+    </step>
+
+    <step id="4" title="Prepare the reaction mix">
+      In the 0.5 mL centrifuge tube, add the reagents for the reaction mixture using the listed volumes. If making a master mix, multiply by the number of reactions and add 10% extra to each shared reagent.
+    </step>
+
+    <step id="5" title="Mix the reaction">
+      Mix the tube gently by pipetting up and down or with a brief gentle vortex, then quick-spin it. The goal is a uniform mix without bubbles or liquid stuck in the cap.
+    </step>
+
+    <step id="6" title="Weigh final master mix">
+      Weigh the 0.5 mL tube containing the final mix and record the value. This serves as a quick check that the expected amount of liquid was actually prepared.
+    </step>
+
+    <step id="7" title="Aliquot into PCR tubes">
+      Transfer the proper amount of reaction mixture into each labeled PCR tube. Pipette slowly into the bottom of the tube so the full volume goes in cleanly.
+    </step>
+
+    <step id="8" title="Seat tubes in thermocycler">
+      Place all 5 PCR tubes in the thermocycler and close the lid for 5 seconds. This appears to be a tube seating or cap check, not the full PCR run, since no cycling program is listed.
+    </step>
+
+    <step id="9" title="Weigh filled PCR tubes">
+      Remove the tubes and record the final weight of each PCR tube. Compare these to the empty weights to confirm each tube received roughly the correct amount of liquid.
+    </step>
+
+    <step id="10" title="Prepare 1:25 dilution with EDTA">
+      Make a 1:25 dilution by mixing 1 part sample with 24 parts EDTA. Mix well so the dilution is uniform before using it for any downstream step.
+    </step>
+  </protocol_steps>
+
+  <common_errors>
+    <error>Not changing tips after touching template DNA. This can contaminate other reactions and create false amplification.</error>
+    <error>Reusing pipette tips between reagents or samples. This can contaminate stock reagents or transfer DNA into the wrong reaction.</error>
+  </common_errors>
+
+  <notes>
+    <note>The listed reagent volumes already total 25 uL, so the role of dH2O is unclear in the source text.</note>
+    <note>The protocol does not provide thermocycler cycling conditions.</note>
+    <note>The protocol should be checked against the original source before execution if exact reagent volumes are critical.</note>
+  </notes>
+</pcr_protocol>
