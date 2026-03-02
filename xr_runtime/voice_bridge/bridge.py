@@ -71,6 +71,7 @@ CHUNK_SIZE = int(SAMPLE_RATE * (AUDIO_CHUNK_MS / 1000.0) * BYTES_PER_SAMPLE)
 
 _xr_conn = None
 _status: Optional[StatusManager] = None
+_ww_filter: Optional[WakeWordFilter] = None
 _tts_playing = False
 _tts_cancel = asyncio.Event()
 
@@ -378,6 +379,8 @@ async def _trigger_tts(text: str):
     finally:
         await asyncio.sleep(0.3)
         _tts_playing = False
+        if _ww_filter is not None:
+            _ww_filter.touch()
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +435,7 @@ async def _frame_stream_task(ws_client: NATWebSocketClient):
 # ---------------------------------------------------------------------------
 
 async def main():
-    global _status
+    global _status, _ww_filter
 
     logger.info(f"[Bridge] Starting for camera {CAMERA_INDEX}, session {SESSION_ID}")
 
@@ -448,6 +451,7 @@ async def main():
         wake_words=WAKE_WORDS,
         timeout_seconds=WAKE_TIMEOUT,
     )
+    _ww_filter = ww_filter
 
     accumulator = UtteranceAccumulator()
 

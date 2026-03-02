@@ -262,6 +262,14 @@ Valid `message_type` values: `GENERIC`, `SINGLE_STEP_PANEL_CONTENT`, `COMPONENTS
 {"type": "tts_only", "text": "Processing your request", "priority": "normal"}
 ```
 
+**`tool_call`** -- Notify the runtime about tool/function call activity. Displayed on the glasses as a GENERIC message with source "Tool".
+
+```json
+{"type": "tool_call", "tool_name": "search_protocols", "summary": "Searching for PCR protocols", "status": "started"}
+```
+
+Valid `status` values: `started`, `completed`, `failed`.
+
 **`wake_timeout`** -- Override the wake word auto-deactivation timer.
 
 ```json

@@ -92,6 +92,15 @@ class WakeWordFilter:
         self._last_activity = time.monotonic()
         return text
 
+    def touch(self):
+        """Reset the inactivity timer without changing state.
+
+        Call this after TTS finishes so the user has a full timeout
+        window to continue the conversation without re-saying the wake word.
+        """
+        if self._state == State.ACTIVE:
+            self._last_activity = time.monotonic()
+
     def _activate(self):
         self._state = State.ACTIVE
         self._last_activity = time.monotonic()

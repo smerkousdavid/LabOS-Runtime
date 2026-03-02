@@ -176,6 +176,7 @@ The runtime connects to the NAT agent server over WebSocket. All messages are JS
 | `display_update` | Push to glasses display | `message_type` (`GENERIC` / `SINGLE_STEP_PANEL_CONTENT` / `COMPONENTS_STATUS`), `payload` (JSON string) |
 | `request_frames` | Capture camera frames | `request_id`, `count`, `interval_ms` |
 | `tts_only` | Speak without display | `text`, `priority` (`normal` / `high`) |
+| `tool_call` | Notify runtime of tool activity | `tool_name`, `summary`, `status` (`started` / `completed` / `failed`) |
 | `wake_timeout` | Override wake word timeout | `seconds` |
 | `pong` | Keepalive reply | -- |
 
