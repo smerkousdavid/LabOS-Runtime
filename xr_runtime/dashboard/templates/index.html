@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XR Message Control</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>XR Message Control</h1>
+        
+        <div id="connectionStatus" class="connection-status">
+            Checking connection...
+        </div>
+
+        <!-- Device Selection -->
+        <div class="form-group">
+            <label for="cameraSelect">Select Device:</label>
+            <select id="cameraSelect">
+                <option value="">-- Loading devices --</option>
+            </select>
+        </div>
+
+        <!-- Dynamic Path Display -->
+        <div id="pathDisplay" class="path-display" style="display: none;">
+            <h3>Stream Information</h3>
+            <div id="streamPaths"></div>
+        </div>
+
+        <!-- Message/Audio/TTS Tabs -->
+        <div class="tabs">
+            <button class="tab-button active" data-tab="message-tab">Send Message</button>
+            <button class="tab-button" data-tab="audio-tab">Upload Audio</button>
+            <button class="tab-button" data-tab="tts-tab">Text-to-Speech</button>
+        </div>
+
+        <!-- Message Tab -->
+        <div id="message-tab" class="tab-content active">
+            <form id="messageForm">
+                <div class="form-group">
+                    <label for="messageType">Message Type:</label>
+                    <input type="text" id="messageType" name="messageType" required 
+                           placeholder="e.g., command, notification, data">
+                </div>
+                
+                <div class="form-group">
+                    <label for="payload">Payload:</label>
+                    <textarea id="payload" name="payload" required 
+                              placeholder="Enter your message payload here..."></textarea>
+                </div>
+                
+                <button type="submit" class="btn" id="sendMessageBtn">Send Message</button>
+            </form>
+            <div id="messageStatus" class="status" style="display: none;"></div>
+        </div>
+
+        <!-- Audio Tab -->
+        <div id="audio-tab" class="tab-content">
+            <form id="audioForm">
+                <div class="form-group">
+                    <label for="audioFile">Audio File:</label>
+                    <input type="file" id="audioFile" name="audioFile" accept="audio/*,.wav,.mp3,.pcm,.raw" required 
+                           style="padding: 10px;">
+                </div>
+                
+                <div class="form-group">
+                    <label for="sampleRate">Sample Rate (Hz):</label>
+                    <input type="number" id="sampleRate" name="sampleRate" value="16000" required 
+                           placeholder="e.g., 16000, 44100, 48000">
+                </div>
+                
+                <div class="form-group">
+                    <label for="audioMethod">Send Method:</label>
+                    <select id="audioMethod" name="audioMethod">
+                        <option value="streaming" selected>Streaming (TTS-like, recommended) 🎵</option>
+                        <option value="audio">Audio Stream (single chunk)</option>
+                        <option value="blob">Blob Message (experimental)</option>
+                    </select>
+                    <small style="color: #666; display: block; margin-top: 5px;">
+                        <strong>Streaming mode</strong> sends audio in small chunks like TTS, preventing pitch/speed issues
+                    </small>
+                </div>
+                
+                <div class="form-group" id="chunkDurationGroup">
+                    <label for="chunkDuration">Chunk Duration (ms):</label>
+                    <input type="number" id="chunkDuration" name="chunkDuration" value="100" min="10" max="1000" step="10"
+                           placeholder="100">
+                    <small style="color: #666; display: block; margin-top: 5px;">
+                        Smaller chunks = smoother playback, larger chunks = less overhead (default: 100ms)
+                    </small>
+                </div>
+                
+                <button type="submit" class="btn" id="sendAudioBtn">Send Audio</button>
+            </form>
+            <div id="audioStatus" class="status" style="display: none;"></div>
+        </div>
+
+        <!-- TTS Tab -->
+        <div id="tts-tab" class="tab-content">
+            <form id="ttsForm">
+                <div class="form-group">
+                    <label for="ttsText">Text to Synthesize:</label>
+                    <textarea id="ttsText" name="ttsText" required 
+                              placeholder="Enter text you want to convert to speech..."></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ttsModel">TTS Model:</label>
+                    <select id="ttsModel" name="ttsModel">
+                        <option value="">-- Loading models --</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ttsLanguage">Language:</label>
+                    <select id="ttsLanguage" name="ttsLanguage">
+                        <option value="en">English</option>
+                        <option value="zh">Chinese (Simplified)</option>
+                        <option value="ja">Japanese</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label for="ttsVoice">Voice:</label>
+                    <select id="ttsVoice" name="ttsVoice">
+                        <option value="default">Default</option>
+                        <option value="male">Male</option>
+                        <option value="female">Female</option>
+                    </select>
+                </div>
+
+                <div id="ttsPathInfo" class="info-box" style="display: none;">
+                    <strong>Output Stream:</strong>
+                    <code id="ttsPaths"></code>
+                </div>
+                
+                <button type="submit" class="btn" id="sendTtsBtn">Generate & Send TTS</button>
+            </form>
+            <div id="ttsStatus" class="status" style="display: none;"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

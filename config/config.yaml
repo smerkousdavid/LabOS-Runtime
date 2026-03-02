@@ -1,0 +1,88 @@
+# =============================================================================
+# LabOS XR Runtime -- Desktop Application Configuration
+#
+# Edit this file to configure your runtime. Then run:
+#   ./run.sh          (Linux/macOS)
+#   run.bat           (Windows)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# NAT Server -- external agent server connection
+# Set this to the WebSocket URL of your NAT server.
+# ---------------------------------------------------------------------------
+nat_server:
+  url: "ws://localhost:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+
+# ---------------------------------------------------------------------------
+# XR Runtime -- streaming, video, gRPC
+# ---------------------------------------------------------------------------
+runtime:
+  num_cameras: 1
+  streaming:
+    method: mediamtx                      # mediamtx | gstreamer
+    framerate: 30
+    mediamtx_port: 8554
+    mediamtx_service_name: mediamtx
+
+# ---------------------------------------------------------------------------
+# Speech services -- STT and TTS endpoints (external)
+# Point these to wherever your STT/TTS models are running.
+# ---------------------------------------------------------------------------
+speech:
+  stt:
+    host: "localhost"                     # STT server hostname or IP
+    port: 50051
+    protocol: grpc                        # grpc | http
+
+  tts:
+    enabled: true
+    provider: vibevoice                   # riva | qwen | vibevoice
+    riva:
+      host: riva-server
+      port: 50051
+    qwen:
+      base_url: https://dashscope.aliyuncs.com/api/v1
+      api_key_env: DASHSCOPE_API_KEY
+    vibevoice:
+      host: "localhost"                   # TTS server hostname or IP
+      port: 8050
+
+# ---------------------------------------------------------------------------
+# Dashboard -- local web UI
+# ---------------------------------------------------------------------------
+dashboard:
+  port: 5001
+
+# ---------------------------------------------------------------------------
+# NVR (Shinobi) -- optional video recording
+# ---------------------------------------------------------------------------
+nvr:
+  enabled: false
+  port: 8088
+  credentials:
+    email: viture@test.com
+    password: test1234
+  shinobi:
+    group_key: KpM6j63XY7
+    unique_id: 8N8ngH8WUt
+    api_key: eTJceyxeZWnaGqUKx1Asw0u3m29frk
+    storage_size: 300000
+
+# ---------------------------------------------------------------------------
+# Wake word settings (for voice bridge)
+# ---------------------------------------------------------------------------
+wakeword:
+  words:
+    - stella
+    - hey stella
+  timeout_seconds: 10
+  sleep_commands:
+    - thanks
+    - goodbye
+    - go to sleep
+
+# ---------------------------------------------------------------------------
+# Global settings
+# ---------------------------------------------------------------------------
+global:
+  secrets_file: config/.env.secrets

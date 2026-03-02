@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "rtsp-server"
+version = "0.1.0"
+description = ""
+authors = ["Chao-Yeh Chen <chaoyehc@nvidia.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+opencv-python = "^4.11.0.86"
+numpy = "^2.3.0"
+pygobject = "<=3.51"
+loguru = "^0.7.3"
+xr-service-library = {path = "../xr_service_library/xr_service_library-0.1-py3-none-any.whl"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

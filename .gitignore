@@ -1,0 +1,28 @@
+# Secrets (never commit)
+config/.env.secrets
+.env.secrets
+.env
+
+# Generated compose
+compose.yaml
+
+# Runtime logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# NVR data
+xr_runtime/nvr/mysql/
+xr_runtime/nvr/videos/
+
+# IDE
+.vscode/
+.idea/
+
+# Generated configs
+xr_runtime/streaming/mediamtx.yml
+xr_runtime/speech/tts_pusher/tts_models.yaml

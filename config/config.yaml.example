@@ -1,0 +1,50 @@
+# =============================================================================
+# LabOS XR Runtime -- Desktop Application Configuration (Example)
+#
+# Copy this file to config.yaml and edit for your environment:
+#   cp config.yaml.example config.yaml
+# =============================================================================
+
+# NAT Server -- external agent server connection
+nat_server:
+  url: "ws://192.168.1.100:8002/ws"      # Set to your NAT server's address
+
+# XR Runtime
+runtime:
+  num_cameras: 1
+  streaming:
+    method: mediamtx
+    framerate: 30
+    mediamtx_port: 8554
+    mediamtx_service_name: mediamtx
+
+# Speech services (external endpoints)
+speech:
+  stt:
+    host: "192.168.1.100"                 # Your STT server
+    port: 50051
+    protocol: grpc
+  tts:
+    enabled: true
+    provider: vibevoice
+    vibevoice:
+      host: "192.168.1.100"              # Your TTS server
+      port: 8050
+
+# Dashboard
+dashboard:
+  port: 5001
+
+# NVR (optional)
+nvr:
+  enabled: false
+
+# Wake word
+wakeword:
+  words: [stella, hey stella]
+  timeout_seconds: 10
+  sleep_commands: [thanks, goodbye, go to sleep]
+
+# Global
+global:
+  secrets_file: config/.env.secrets

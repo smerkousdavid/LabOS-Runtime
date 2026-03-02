@@ -1,0 +1,39 @@
+{
+  "port": 8080,
+  "debugLog": false,
+  "enableFaceManager": false,
+  "videosDir": "__DIR__/videos",
+
+  "passwordType": "sha256",
+  "detectorMergePamRegionTriggers": true,
+  "wallClockTimestampAsDefault": true,
+  "useBetterP2P": true,
+  "smtpServerOptions": {
+    "allowInsecureAuth": true
+  },
+  "addStorage": [
+    {
+      "name": "second",
+      "path": "__DIR__/videos2"
+    }
+  ],
+  "db": {
+    "host": "db",
+    "user": "shinobi_dev_user",
+    "password": "pass",
+    "database": "shinobi_dev",
+    "port": 3306
+  },
+  "mail": {
+    "service": "gmail",
+    "auth": {
+      "user": "your_email@gmail.com",
+      "pass": "your_password_or_app_specific_password"
+    }
+  },
+  "cron": {
+    "key": "EeNgeep7"
+  },
+  "pluginKeys": {},
+  "cpuUsageMarker": "%Cpu(s)"
+}
