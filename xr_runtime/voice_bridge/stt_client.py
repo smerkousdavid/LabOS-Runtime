@@ -138,9 +138,10 @@ class GrpcSTTClient(STTClient):
             rec_config.model = self._model
         config = asr_pb2.StreamingRecognitionConfig(
             config=rec_config,
-            interim_results=False,
+            interim_results=True,
         )
         yield asr_pb2.StreamingRecognizeRequest(streaming_config=config)
+        chunks_sent = 0
         while self._streaming:
             try:
                 chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=0.5)
@@ -148,19 +149,27 @@ class GrpcSTTClient(STTClient):
                 continue
             if chunk is None:
                 break
+            chunks_sent += 1
+            if chunks_sent == 1:
+                logger.info("[STT] First audio chunk sent to gRPC stream")
             yield asr_pb2.StreamingRecognizeRequest(audio_content=chunk)
 
     async def _stream_loop(self):
         backoff = 0.05
         while self._streaming:
             try:
+                logger.info("[STT] Opening gRPC StreamingRecognize stream")
                 responses = self._stub.StreamingRecognize(self._request_generator())
                 async for resp in responses:
                     for result in resp.results:
-                        if result.is_final and result.alternatives:
+                        if result.alternatives:
                             text = result.alternatives[0].transcript.strip()
-                            if text:
+                            if not text:
+                                continue
+                            if result.is_final:
                                 await self._results.put(text)
+                            else:
+                                logger.info(f"[STT] Interim: {text}")
                 backoff = 0.05
             except asyncio.CancelledError:
                 break

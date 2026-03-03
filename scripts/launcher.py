@@ -167,11 +167,13 @@ def create_log_dirs(num_cameras: int):
 # ---------------------------------------------------------------------------
 
 _BRIDGE_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\[STT\] Raw: (.+)"),           "dim"),
-    (re.compile(r"\[STT\] Accepted: (.+)"),       "bold green"),
-    (re.compile(r"\[WakeWord\] State: (.+)"),     "bold yellow"),
-    (re.compile(r"\[TTS\] Speaking: (.+)"),        "bold cyan"),
-    (re.compile(r"\[Session\] (.+)"),              "bold magenta"),
+    (re.compile(r"\[STT\] -> NAT: (.+)"),         "bold green"),
+    (re.compile(r"\[STT\] Barge-in detected: (.+)"), "bold red"),
+    (re.compile(r"\[STT\] Interim: (.+)"),         "dim"),
+    (re.compile(r"\[STT\] (.+)"),                  "white"),
+    (re.compile(r"\[WakeWord\] State: (.+)"),      "bold yellow"),
+    (re.compile(r"\[TTS\] Speaking: (.+)"),         "bold cyan"),
+    (re.compile(r"\[Session\] (.+)"),               "bold magenta"),
 ]
 
 

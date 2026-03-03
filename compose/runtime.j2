@@ -38,8 +38,7 @@ services:
   grpc-server-{{ i+1 }}:
     image: python:3.12.6-slim
     platform: linux/amd64
-    ports:
-      - "{{ base_ports.GRPC_PORT + i }}:5050"
+    network_mode: host
     volumes:
       - ./xr_runtime/grpc_server/main.bin:/home/gRPC_server/main.bin
       - xr_socket_{{ i+1 }}:/tmp
