@@ -1,0 +1,39 @@
+# Object presets for move_to_object, z_level_object, protocols.
+# Single source of truth: yolo_class, shape (physical size + pick location), confidence, pick_type.
+#
+# default_confidence: global YOLO conf threshold. Per-object confidence overrides.
+# Per object:
+#   shape: physical size for 3D estimation; location = where to move to (center, tl, tr, bl, br).
+#     circle: diameter (mm).  square: side (mm).  rect: width, height (mm).
+#   yolo_class: YOLO class name (must match dataset.yaml names).
+#   confidence: optional; YOLO conf threshold for this class (e.g. 0.01 for faint markers).
+#   pick_type: optional; which detection to pick: toolhead_close, camera_center, largest, tl, tr, bl, br, highest_confidence, ranked.
+
+default_confidence: 0.2
+
+50ml eppendorf:
+  shape:
+    type: circle
+    diameter: 33
+    location: center
+  yolo_class: "50Ml eppendorf cap"
+  pick_type: toolhead_close
+
+vortex genie hole:
+  shape:
+    type: circle
+    diameter: 50
+    location: center
+  yolo_class: "Vortex Genie Hole"
+  confidence: 0.1
+  pick_type: ranked  # pick the largest area / highest confidence detection (by getting average rank)
+
+rack hole:
+  shape:
+    type: circle
+    diameter: 28
+    location: center
+  yolo_class: "4 way rack 50ml hole"
+  confidence: 0.25
+  pick_type: toolhead_close
+

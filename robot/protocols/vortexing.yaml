@@ -1,0 +1,49 @@
+# Vortexing protocol: pick tube from rack, vortex it, place back into rack.
+# Run with: python run_protocol.py vortexing
+# Subprotocols can be called with overrides, e.g.:
+#   args:
+#     object: "rack hole"   # for place_into_rack
+
+brief: "Vortex a 50ml eppendorf tube in the vortex genie."
+
+protocol:
+  - step: go_to
+    location: home
+    description: Start at home
+
+  - step: go_to
+    location: rack_watch
+    description: Move to rack watch position
+  - step: run
+    file: steps/rack/pick_up_from_rack.yaml
+    description: Pick tube up from rack
+    major_description: Picks up a 50ml eppendorf tube from the rack.
+    args:
+      object: "50ml eppendorf"
+
+
+  - step: go_to
+    location: vortex_watch
+    description: Move to vortex watch position
+  - step: run
+    file: steps/vortex/vortex_tube.yaml
+    description: Vortex tube
+    major_description: Vortex the tube in the vortex genie 2.
+    args:
+      tube_object: "50ml eppendorf"
+
+  - step: go_to
+    location: rack_watch
+    description: Move to rack watch position
+  - step: run
+    file: steps/rack/place_into_rack.yaml
+    description: Place tube into rack
+    major_description: Places the tube back into the rack.
+    args:
+      object: "rack hole"
+
+failure:
+  - step: grip
+    state: 600
+  - step: stop
+    description: Vortexing protocol failed

@@ -3,6 +3,18 @@ config/.env.secrets
 .env.secrets
 .env
 
+# Robot
+robot/calibration_images/
+robot/archive/
+robot/dataset/
+robot/locations/
+robot/weights/
+robot/runs/
+robot/logs/
+mcp_server.log
+segment-dataset.zip
+robot/**.zip
+
 # Generated compose
 compose.yaml
 

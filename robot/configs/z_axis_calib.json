@@ -1,0 +1,52 @@
+{
+  "metadata": {
+    "timestamp": "2026-02-01T21:39:12.913302",
+    "description": "Toolhead Z-axis projection (u0,v0) at 25mm height steps",
+    "step_mm": 25,
+    "max_height_mm": 300
+  },
+  "z0_reference": [
+    117.345398,
+    -223.112793,
+    1.449425,
+    -178.631911,
+    0.69368,
+    -4.321821
+  ],
+  "projections": [
+    {
+      "height_mm": 225,
+      "u0": 621.18,
+      "v0": 445.58
+    },
+    {
+      "height_mm": 250,
+      "u0": 621.83,
+      "v0": 438.83
+    },
+    {
+      "height_mm": 275,
+      "u0": 622.54,
+      "v0": 432.92
+    },
+    {
+      "height_mm": 300,
+      "u0": 623.23,
+      "v0": 427.58
+    }
+  ],
+  "linear_fit": {
+    "u0_slope": 0.02744,
+    "u0_intercept": 614.992,
+    "v0_slope": -0.23964,
+    "v0_intercept": 499.133
+  },
+  "camera_resolution": [
+    1280,
+    720
+  ],
+  "checkerboard_size": [
+    7,
+    9
+  ]
+}

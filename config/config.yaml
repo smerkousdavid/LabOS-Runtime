@@ -111,6 +111,15 @@ wakeword:
     - go to sleep
 
 # ---------------------------------------------------------------------------
+# Robot runtime -- optional robotic arm integration
+# ---------------------------------------------------------------------------
+robot:
+  enabled: false                          # set to true to include robot in compose stack
+  xarm_ip: "192.168.1.185"               # xArm controller IP address
+  no_vision: false                        # true = skip RealSense camera (headless mode)
+  session_id: "robot-1"                   # WebSocket session identifier
+
+# ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
 session:

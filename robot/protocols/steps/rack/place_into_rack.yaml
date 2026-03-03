@@ -1,0 +1,41 @@
+# Place tube into a rack hole. Default target: rack hole.
+# Can override via run args: object: "rack hole"
+args:
+  object: "rack hole"
+
+protocol:
+  - step: move_to_object
+    object: "{{object}}"
+    offset: [-40, 0]
+    pick_type: toolhead_close
+    description: Move toward rack hole
+  - step: z_level
+    height: 200
+    description: Move down for better view
+  - step: move_to_object
+    object: "{{object}}"
+    offset: [0, 0]
+    pick_type: toolhead_close
+    speed: 100
+    acc: 200
+    description: Center over hole
+  - step: z_level
+    height: 150
+    description: Move down toward rack
+  - step: z_level
+    height: 116
+    speed: 200
+    acc: 200
+    description: Final descent to place
+  - step: grip
+    state: 600
+    speed: 5000
+    description: Open gripper to drop tube
+  - step: z_level
+    height: 175
+    speed: 100
+    acc: 150
+    description: Clear rack hole
+  - step: go_to
+    location: home
+    description: Return home

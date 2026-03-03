@@ -153,11 +153,13 @@ def watch_grpc_logs(camera: int = 1, timeout: int = 0):
 # Log directory setup
 # ---------------------------------------------------------------------------
 
-def create_log_dirs(num_cameras: int):
+def create_log_dirs(num_cameras: int, cfg: dict | None = None):
     dirs = ["mediamtx", "dashboard", "tts_pusher", "tts_mixer"]
     for i in range(1, num_cameras + 1):
         dirs += [f"grpc_{i}", f"video_pusher_{i}", f"audio_pusher_{i}",
                  f"av_merger_{i}", f"voice_bridge_{i}"]
+    if cfg and cfg.get("robot", {}).get("enabled", False):
+        dirs.append("robot_runtime")
     for d in dirs:
         (ROOT / "logs" / d).mkdir(parents=True, exist_ok=True)
 
@@ -344,7 +346,7 @@ def main():
              str(ROOT / "xr_runtime")])
 
     # ── Create log directories ────────────────────────────────────────────
-    create_log_dirs(num_cameras)
+    create_log_dirs(num_cameras, cfg)
 
     # ── Generate compose.yaml ─────────────────────────────────────────────
     streaming = cfg.get("runtime", {}).get("streaming", {})

@@ -1,0 +1,15 @@
+# Example protocol: equivalent to test.py (load home, home, move 10,0,-5, home)
+protocol:
+  - step: load_home
+    file: home.json
+  - step: home
+  - step: move
+    description: "10 mm in home X, 5 mm down in home Z"
+    relative: [10, 0, -5]
+  - step: home
+
+failure:
+  - step: grip
+    state: 800
+  - step: stop
+    description: "Robot failed"

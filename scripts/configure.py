@@ -232,6 +232,12 @@ def generate_env(cfg: dict, secrets: dict) -> str:
         "# Session",
         f"RESET_SESSION_ON_DISCONNECT={session.get('reset_on_disconnect', 'false')}",
         "",
+        "# Robot Runtime",
+        f"ENABLE_ROBOT={'true' if cfg.get('robot', {}).get('enabled', False) else 'false'}",
+        f"XARM_IP={cfg.get('robot', {}).get('xarm_ip', '192.168.1.185')}",
+        f"ROBOT_SESSION_ID={cfg.get('robot', {}).get('session_id', 'robot-1')}",
+        f"ROBOT_NO_VISION={'true' if cfg.get('robot', {}).get('no_vision', False) else 'false'}",
+        "",
     ]
     return "\n".join(lines)
 

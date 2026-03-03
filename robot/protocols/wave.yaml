@@ -1,0 +1,49 @@
+brief: Short little wave to say hi
+protocol:
+- step: go_to
+  location: wave
+  description: Start at wave
+- step: move_joint
+  relative:
+  - 0.0
+  - -0.03
+  - 0.0
+  - 0.05
+  - -43.54
+  - 0.16
+  - 0.0
+- step: move_joint
+  relative:
+  - 0.0
+  - -0.03
+  - -0.0
+  - -0.02
+  - 0.0
+  - -58.99
+  - 0.0
+- step: move_joint
+  relative:
+  - -0.0
+  - 0.03
+  - 0.0
+  - 0.07
+  - 0.0
+  - 124.76
+  - 0.0
+- step: move_joint
+  relative:
+  - -0.01
+  - -0.14
+  - -0.05
+  - -0.0
+  - 31.56
+  - -59.01
+  - 0.0
+- step: move
+  relative:
+  - -344.16
+  - -165.43
+  - -115.31
+  - 9.6
+  - 10.59
+  - 95.65

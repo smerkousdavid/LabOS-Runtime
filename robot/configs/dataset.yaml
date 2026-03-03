@@ -1,0 +1,21 @@
+# YOLO-World Dataset Configuration
+# Auto-generated from COCO annotations
+
+# Dataset path
+path: C:\Users\ar1\Documents\ARM\version2\dataset
+train: images
+val: images
+
+# Number of classes
+nc: 8
+
+# Class names
+names:
+  0: Vortex Genie 2
+  1: Vortex Genie Hole
+  2: Vortex Genie Top Plate
+  3: 50ml eppendorf tube
+  4: 50Ml eppendorf cap
+  5: 50Ml 4 way rack
+  6: 4 way rack 50ml hole
+  7: 4 way rack 5ml hole

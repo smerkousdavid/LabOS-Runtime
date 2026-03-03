@@ -1,0 +1,8 @@
+websockets>=12.0
+loguru>=0.7
+numpy
+opencv-python-headless
+pyyaml
+xarm-python-sdk
+pyrealsense2
+mcp

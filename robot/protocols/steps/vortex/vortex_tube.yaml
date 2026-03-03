@@ -1,0 +1,86 @@
+# Vortex the tube in the vortex genie. Tube object for re-center after vortex: 50ml eppendorf.
+args:
+  tube_object: "50ml eppendorf"
+
+protocol:
+  - step: move_to_object
+    object: vortex genie hole
+    offset: [5, 0]
+    pick_type: ranked
+    description: Center over vortex hole
+  - step: z_level
+    height: 270
+    description: Move down
+  - step: z_level
+    height: 255
+    speed: 75
+    acc: 150
+    description: Slow to final height
+  - step: grip
+    state: 350
+    speed: 1000
+    description: Open gripper (slow)
+  - step: grip
+    state: 500
+    speed: 5000
+    description: Open gripper (fast)
+  - step: z_level
+    height: 285
+    description: Move tool up
+  - step: move
+    relative: [0, -30, 0]
+    description: Move left over tube
+  - step: z_level
+    height: 266.5
+    speed: 75
+    acc: 150
+    description: Press tube down
+  - step: z_level
+    height: 268.5
+    speed: 30
+    acc: 60
+    description: Release slightly to vibrate
+  - step: sleep
+    seconds: 2
+    description: Vortex
+  - step: z_level
+    height: 273
+    speed: 75
+    acc: 125
+    description: Move up to stop
+  - step: sleep
+    seconds: 1
+    description: Wait for vibration to stop
+  - step: z_level
+    height: 285
+    speed: 75
+    acc: 150
+    description: Clear tube
+  - step: move
+    relative: [0, 30, 0]
+    description: Move right over tube
+  - step: grip
+    state: 600
+    speed: 5000
+    description: Open gripper wider
+  - step: move_to_object
+    object: "{{tube_object}}"
+    offset: [0, 0]
+    description: Re-center over tube
+  - step: z_level
+    height: 255
+    speed: 100
+    acc: 80
+    description: Move down to grab tube
+  - step: grip
+    state: 200
+    speed: 1000
+    description: Close gripper on tube
+  - step: z_level
+    height: 270
+    speed: 50
+    acc: 100
+    description: Clear vortex hole
+  - step: z_level
+    height: 300
+    description: Raise to travel height

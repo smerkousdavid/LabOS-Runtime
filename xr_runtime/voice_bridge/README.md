@@ -278,6 +278,51 @@ Valid `status` values: `started`, `completed`, `failed`.
 
 **`pong`** -- Keepalive reply to `ping`.
 
+### Robot Runtime Messages
+
+These messages are exchanged between the robot-runtime client and the NAT server. The robot-runtime connects as a separate WebSocket client alongside the voice bridge.
+
+**`robot_register`** (robot -> NAT) -- Sent on connect. Declares available tools so the NAT agent can call them.
+
+```json
+{
+  "type": "robot_register",
+  "session_id": "robot-1",
+  "tools": [
+    {
+      "name": "start_protocol",
+      "description": "Start a protocol by name.",
+      "parameters": {"protocol_name": {"type": "string", "required": true}}
+    }
+  ]
+}
+```
+
+**`robot_execute`** (NAT -> robot) -- Invoke a tool on the robot.
+
+```json
+{
+  "type": "robot_execute",
+  "request_id": "uuid-1234",
+  "tool_name": "start_protocol",
+  "arguments": {"protocol_name": "vortexing"}
+}
+```
+
+**`robot_result`** (robot -> NAT) -- Result of a tool execution.
+
+```json
+{
+  "type": "robot_result",
+  "request_id": "uuid-1234",
+  "tool_name": "start_protocol",
+  "success": true,
+  "result": "Started protocol 'vortexing'."
+}
+```
+
+Available robot tools: `get_status`, `start_protocol`, `get_protocols`, `describe_protocol`, `stop_robot`, `get_object_definitions`, `list_objects`, `move_to_object`, `gripper`, `z_level`, `is_holding_something`, `go_home`, `see_object`, `manual_mode`. See `robot/robot_runtime.py` for full parameter definitions.
+
 ### RTSP Stream Access
 
 The preferred way for the NAT server to consume video/audio is via RTSP. On WebSocket connect:

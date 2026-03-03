@@ -1,0 +1,54 @@
+# Pick up a tube from the rack. Default tube object: 50ml eppendorf.
+# Can override via run args: object: "50ml eppendorf"
+args:
+  object: "50ml eppendorf"
+
+protocol:
+  - step: grip
+    state: 600
+    speed: 5000
+    description: Open gripper for better view
+  - step: move_to_object
+    object: "{{object}}"
+    offset: [-40, 0]
+    pick_type: toolhead_close
+    description: Move toward tube
+  - step: z_level
+    height: 180
+    description: Move down for better view
+  - step: move_to_object
+    object: "{{object}}"
+    offset: [0, 0]
+    pick_type: toolhead_close
+    description: Hover over tube
+  - step: z_level
+    height: 102
+    description: Go down over tube
+  - step: grip
+    state: 200
+    speed: 1000
+    description: Close gripper to grab tube
+  # - step: z_level
+  #   height: 110
+  #   speed: 50
+  #   acc: 80
+  #   description: Move up slightly
+  # - step: grip
+  #   state: 600
+  #   speed: 5000
+  #   description: Drop tube (release)
+  # - step: z_level
+  #   height: 102
+  #   description: Go back down over tube
+  # - step: grip
+  #   state: 200
+  #   speed: 2000
+  #   description: Grab tube again
+  - step: z_level
+    height: 140
+    speed: 100
+    acc: 200
+    description: Move up to clear rack
+  - step: z_level
+    height: 275
+    description: Raise to travel height

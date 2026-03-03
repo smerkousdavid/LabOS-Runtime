@@ -245,6 +245,37 @@ services:
 {% endif %}
 {% endif %}
 
+{% if ENABLE_ROBOT %}
+  # ===========================================================================
+  # Robot Runtime -- xArm integration via NAT WebSocket
+  # ===========================================================================
+  robot-runtime:
+    build:
+      context: ./robot
+      dockerfile: Dockerfile
+    volumes:
+      - ./robot/protocols:/app/protocols:ro
+      - ./robot/configs:/app/configs:ro
+      - ./robot/locations:/app/locations:ro
+      - ./logs/robot_runtime:/app/logs
+    env_file: .env
+    environment:
+      - NAT_SERVER_URL={{ nat_server_url }}
+      - XARM_IP={{ xarm_ip }}
+      - ROBOT_SESSION_ID={{ robot_session_id }}
+      - ROBOT_NO_VISION={{ robot_no_vision }}
+      - LOG_DIR=/app/logs
+      - LOGURU_LEVEL=INFO
+    restart: unless-stopped
+    logging: *default-logging
+    container_name: labos_robot_runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Uncomment for RealSense USB passthrough:
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+{% endif %}
+
 {% if ENABLE_NVR %}
   # ===========================================================================
   # NVR -- Shinobi

@@ -354,6 +354,7 @@ Everything below is reference material for developers and advanced configuration
 | `runtime` | Camera count, streaming method, framerate |
 | `dashboard` | Local dashboard port (default 5001) |
 | `nvr` | Optional Shinobi NVR for video recording |
+| `robot` | Optional robot runtime (xarm_ip, enabled, no_vision, session_id) |
 | `wakeword` | Wake words, timeout, sleep commands |
 
 No API keys are needed on the desktop app unless using cloud STT/TTS (e.g. ElevenLabs).
@@ -406,6 +407,7 @@ When running, Docker Compose manages these containers:
 | Dashboard | 5001 | Web UI |
 | TTS Pusher | 5100 | TTS synthesis routing |
 | TTS Mixer | 5004 | RTSP audio publisher |
+| Robot Runtime | -- | xArm tool execution via NAT WS (optional) |
 
 ### NAT WebSocket Protocol
 
@@ -438,6 +440,16 @@ The runtime connects to the NAT agent server over WebSocket. All messages are JS
 | `wake_timeout` | Override wake word timeout | `seconds` |
 | `pong` | Keepalive reply | -- |
 
+#### Robot Runtime <-> NAT
+
+| Type | Direction | Key Fields |
+|---|---|---|
+| `robot_register` | robot -> NAT | `session_id`, `tools` (array of `{name, description, parameters}`) |
+| `robot_execute` | NAT -> robot | `request_id`, `tool_name`, `arguments` |
+| `robot_result` | robot -> NAT | `request_id`, `tool_name`, `success`, `result` |
+
+See `robot/README.md` for the full list of available tools.
+
 #### Consuming RTSP from the NAT server
 
 1. On WebSocket connect, listen for the `stream_info` message
@@ -459,7 +471,8 @@ logs/
 ├── dashboard/
 ├── tts_pusher/
 ├── tts_mixer/
-└── mediamtx/
+├── mediamtx/
+└── robot_runtime/          # (when robot.enabled)
 ```
 
 ### Directory Structure
@@ -492,6 +505,13 @@ labos-runtime/
 │   ├── dashboard/                # Flask web UI
 │   ├── speech/                   # TTS pusher and mixer
 │   └── nvr/                      # Shinobi NVR (optional)
+├── robot/                        # xArm robot runtime (optional)
+│   ├── robot_runtime.py          # WebSocket client + tool executor
+│   ├── Dockerfile
+│   ├── run.sh / run.bat          # Standalone launchers
+│   ├── aira/                     # Robot control library
+│   ├── protocols/                # Robot protocol YAML files
+│   └── configs/                  # Object definitions, locations
 ├── viture/                       # VITURE glasses APK, config, docs
 └── logs/                         # Per-service log files
 ```
