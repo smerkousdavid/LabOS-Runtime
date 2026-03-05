@@ -7,18 +7,18 @@ Docker Compose generation using Jinja2 templates. Creates a `compose.yaml` with 
 ## How It Works
 
 ```
-architecture.yaml
+config/config.yaml
        |
        v
-  configure.py  -->  .env (ports, image names, flags)
+  scripts/configure.py  -->  .env (ports, image names, flags)
        |
        v
-  generate.py   -->  compose.yaml
+  compose/generate.py   -->  compose.yaml
        |
     reads .env + runtime.j2 template
 ```
 
-1. `configure.py` reads `architecture.yaml` and generates `.env` with all Docker Compose variables
+1. `scripts/configure.py` reads `config/config.yaml` and generates `.env` with all Docker Compose variables
 2. `generate.py` reads `.env` and renders `runtime.j2` with Jinja2, producing the final `compose.yaml`
 3. `start.sh` runs both steps, then `docker compose -f compose.yaml up -d`
 

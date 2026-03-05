@@ -23,7 +23,24 @@ speech:
   stt:
     host: "192.168.1.100"                 # Your STT server
     port: 50051
-    protocol: grpc
+    protocol: elevenlabs_realtime
+    model: "scribe_v2_realtime"
+    language: "en"
+    commit_interval_s: 0.25
+    min_speech_duration_ms: 500
+    min_silence_duration_ms: 500
+    include_timestamps: true
+    fallback_recover_after_s: 30
+    fallback:
+      protocol: grpc
+      host: "192.168.1.100"
+      port: 50051
+      model: "parakeet-1.1b-en-US-asr-streaming"
+    noise_correction:
+      enabled: true
+      gate_rms: 120
+      suppression_terms: [mhm, mm, mmm, hmm, hm, uh, um, ah, oh, uh-huh, mm-hmm, "mhm mhm", "so so", he, ha, hey, hi]
+      spam_guard_window_s: 1.0
   tts:
     enabled: true
     provider: vibevoice

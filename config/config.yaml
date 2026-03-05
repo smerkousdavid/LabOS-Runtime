@@ -11,7 +11,7 @@
 # Set this to the WebSocket URL of your NAT server.
 # ---------------------------------------------------------------------------
 nat_server:
-  url: "ws://labos-nat:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+  url: "ws://localhost:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
 
 # ---------------------------------------------------------------------------
 # XR Runtime -- streaming, video, gRPC
@@ -30,10 +30,45 @@ runtime:
 # ---------------------------------------------------------------------------
 speech:
   stt:
-    host: "labos-nat"                     # STT server hostname or IP
+    protocol: grpc                          # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs_realtime
+    host: "localhost"
     port: 50051
-    protocol: grpc                        # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs
     model: "parakeet-1.1b-en-US-asr-streaming"
+    # language: "en"
+    # commit_interval_s: 0.3
+    # min_speech_duration_ms: 100
+    min_silence_duration_ms: 300
+    # include_timestamps: true
+    # fallback_recover_after_s: 30
+    # fallback:
+    #   protocol: grpc
+    #   host: "localhost"
+    #   port: 50051
+    #   model: "parakeet-1.1b-en-US-asr-streaming"
+    # noise_correction:
+    #   enabled: true
+    #   gate_rms: 120
+    #   suppression_terms:
+    #     - mhm
+    #     - mm
+    #     - mmm
+    #     - hmm
+    #     - hm
+    #     - uh
+    #     - um
+    #     - oh
+    #     - uh-huh
+    #     - mm-hmm
+    #     - "mhm mhm"
+    #     - "so so"
+    #   spam_guard_window_s: 1.0
+    # endpointing:
+    #   start_history: 0
+    #   start_threshold: 0.0
+    #   stop_history: 0
+    #   stop_threshold: 0.0
+    #   stop_history_eou: 0
+    #   stop_threshold_eou: 0.0
 
   tts:
     enabled: true
@@ -45,7 +80,7 @@ speech:
       base_url: https://dashscope.aliyuncs.com/api/v1
       api_key_env: DASHSCOPE_API_KEY
     vibevoice:
-      host: "labos-nat"                   # TTS server hostname or IP
+      host: "localhost"                   # TTS server hostname or IP
       port: 8050
     elevenlabs:
       voice_id: "pNInz6obpgDQGcFmaJgB"       # Adam pre-made voice
@@ -73,13 +108,25 @@ nvr:
     storage_size: 300000
 
 # ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+features:
+  fast_path_enabled: false              # bypass LLM for "next step"/"previous step"
+
+# ---------------------------------------------------------------------------
 # Video frame streaming (over NAT WebSocket)
 # ---------------------------------------------------------------------------
 frame_streaming:
-  enabled: false                          # set to true to push frames over WS
-  width: 640
-  height: 480
-  fps: 15
+  enabled: true                           # push frames over WS for STELLA VLM
+  width: 384
+  height: 384
+  fps: 2
+
+# ---------------------------------------------------------------------------
+# LabOS Live Session -- QR code scanning and RTSP relay
+# ---------------------------------------------------------------------------
+labos_live:
+  initial_qr_code: false                  # show QR scanning prompt on XR startup
 
 # ---------------------------------------------------------------------------
 # RTSP external access

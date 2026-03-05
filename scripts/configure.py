@@ -138,6 +138,15 @@ def generate_env(cfg: dict, secrets: dict) -> str:
 
     streaming = rt.get("streaming", {})
     stt = sp.get("stt", {})
+    stt_fallback = stt.get("fallback", {})
+    stt_noise = stt.get("noise_correction", {})
+    stt_endpointing = stt.get("endpointing", {})
+    suppression_terms = stt_noise.get("suppression_terms", [])
+    if isinstance(suppression_terms, (list, tuple)):
+        suppression_terms_env = ",".join(str(x) for x in suppression_terms)
+    else:
+        suppression_terms_env = str(suppression_terms or "")
+
     tts = sp.get("tts", {})
     nvr_creds = nvr.get("credentials", {})
     shinobi = nvr.get("shinobi", {})
@@ -196,6 +205,26 @@ def generate_env(cfg: dict, secrets: dict) -> str:
         f"STT_PORT={stt.get('port', 50051)}",
         f"STT_PROTOCOL={stt.get('protocol', 'grpc')}",
         f"STT_MODEL={stt.get('model', '')}",
+        f"STT_LANGUAGE={stt.get('language', 'en')}",
+        f"STT_COMMIT_INTERVAL_S={stt.get('commit_interval_s', 0.25)}",
+        f"STT_MIN_SPEECH_DURATION_MS={stt.get('min_speech_duration_ms', 500)}",
+        f"STT_MIN_SILENCE_DURATION_MS={stt.get('min_silence_duration_ms', 500)}",
+        f"STT_INCLUDE_TIMESTAMPS={'true' if stt.get('include_timestamps', True) else 'false'}",
+        f"STT_FALLBACK_RECOVER_AFTER_S={stt.get('fallback_recover_after_s', 30)}",
+        f"STT_FALLBACK_PROTOCOL={stt_fallback.get('protocol', '')}",
+        f"STT_FALLBACK_HOST={resolve_host(stt_fallback.get('host', stt_host))}",
+        f"STT_FALLBACK_PORT={stt_fallback.get('port', stt.get('port', 50051))}",
+        f"STT_FALLBACK_MODEL={stt_fallback.get('model', '')}",
+        f"STT_NOISE_CORRECTION_ENABLED={'true' if stt_noise.get('enabled', False) else 'false'}",
+        f"STT_NOISE_GATE_RMS={stt_noise.get('gate_rms', 120)}",
+        f"STT_NOISE_SUPPRESSION_TERMS={suppression_terms_env}",
+        f"STT_SPAM_GUARD_WINDOW_S={stt_noise.get('spam_guard_window_s', 1.0)}",
+        f"STT_EP_START_HISTORY={stt_endpointing.get('start_history', 0)}",
+        f"STT_EP_START_THRESHOLD={stt_endpointing.get('start_threshold', 0.0)}",
+        f"STT_EP_STOP_HISTORY={stt_endpointing.get('stop_history', 0)}",
+        f"STT_EP_STOP_THRESHOLD={stt_endpointing.get('stop_threshold', 0.0)}",
+        f"STT_EP_STOP_HISTORY_EOU={stt_endpointing.get('stop_history_eou', 0)}",
+        f"STT_EP_STOP_THRESHOLD_EOU={stt_endpointing.get('stop_threshold_eou', 0.0)}",
         f"ENABLE_TTS={'true' if tts.get('enabled', True) else 'false'}",
         f"TTS_PROVIDER={tts.get('provider', 'vibevoice')}",
         "",
@@ -217,6 +246,9 @@ def generate_env(cfg: dict, secrets: dict) -> str:
         "# Docker Images",
         f"RTSP_IMAGE=labos_streaming:latest",
         "",
+        "# Features",
+        f"ENABLE_FAST_PATH={'true' if cfg.get('features', {}).get('fast_path_enabled', False) else 'false'}",
+        "",
         "# Audio / Video Forwarding",
         f"FORWARD_AUDIO=false",
         f"FORWARD_FRAMES={'true' if cfg.get('frame_streaming', {}).get('enabled', False) else 'false'}",
@@ -224,6 +256,9 @@ def generate_env(cfg: dict, secrets: dict) -> str:
         f"FRAME_HEIGHT={cfg.get('frame_streaming', {}).get('height', 480)}",
         f"FRAME_FPS={cfg.get('frame_streaming', {}).get('fps', 15)}",
         f"RTSP_EXTERNAL_HOST={_rtsp_host}",
+        "",
+        "# LabOS Live Session",
+        f"INITIAL_QR_CODE={'true' if cfg.get('labos_live', {}).get('initial_qr_code', False) else 'false'}",
         "",
         "# Recording",
         f"RECORDING_ENABLED={'true' if cfg.get('recording', {}).get('enabled', False) else 'false'}",
@@ -375,7 +410,7 @@ def main():
     # Warn about empty secrets that the current config needs
     stt_proto = cfg.get("speech", {}).get("stt", {}).get("protocol", "")
     tts_prov = cfg.get("speech", {}).get("tts", {}).get("provider", "")
-    if stt_proto == "elevenlabs" or tts_prov == "elevenlabs":
+    if stt_proto in ("elevenlabs", "elevenlabs_realtime") or tts_prov == "elevenlabs":
         if not secrets.get("ELEVENLABS_API_KEY"):
             print("  Warning: ELEVENLABS_API_KEY is empty in config/.env.secrets")
 

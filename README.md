@@ -359,6 +359,19 @@ Everything below is reference material for developers and advanced configuration
 
 No API keys are needed on the desktop app unless using cloud STT/TTS (e.g. ElevenLabs).
 
+#### ElevenLabs Realtime STT Notes
+
+- Set `speech.stt.protocol: elevenlabs_realtime` (or `elevenlabs` for backward compatibility).
+- Default realtime tuning uses `pcm_16000`, manual commit every `0.25s`, and `min_speech_duration_ms` / `min_silence_duration_ms` at `500`.
+- For resilience, configure `speech.stt.fallback` to a local provider (for example `grpc`) so sessions continue through cloud auth/rate-limit/socket issues.
+- Noise correction is runtime-tunable under `speech.stt.noise_correction` and maps to bridge env keys (`STT_NOISE_*`).
+
+#### STT Canary and Rollback
+
+- Canary: deploy one runtime instance with `speech.stt.protocol: elevenlabs_realtime` and fallback enabled, then monitor logs for `primary_failed` and `fallback_activated`.
+- Verify: check that partial/committed transcripts are produced and wakeword behavior remains unchanged.
+- Rollback: switch `speech.stt.protocol` back to the fallback provider (`grpc`/`parakeet_ws`), re-run `scripts/configure.py`, then restart runtime services.
+
 #### `config/.env.secrets`
 
 API keys for cloud services (ElevenLabs, DashScope, NGC). Copy `config/.env.secrets.example` and fill in values. Keys are injected into `.env` at configure time.

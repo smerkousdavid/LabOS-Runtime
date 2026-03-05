@@ -2,7 +2,7 @@
 
 The glue between the XR glasses audio hardware and the agent server. Replaces the old monolithic Pipecat-based `runtime_connector` with a lightweight, focused service (~200 lines per file).
 
-One instance runs per camera. It pulls audio from MediaMTX, transcribes via STT, filters by wake word, and routes text to the NAT server over WebSocket. On the return path, it dispatches TTS synthesis and XR display updates.
+One instance runs per camera. It pulls audio from MediaMTX, transcribes via STT, applies text corrections, filters by wake word, and routes text to the NAT server over WebSocket. On the return path, it dispatches TTS synthesis and XR display updates.
 
 ---
 
@@ -15,9 +15,15 @@ graph TD
         FFMPEG["FFmpeg subprocess<br/>decode to s16le 16kHz mono"]
     end
 
+    subgraph noiseGate [Noise Gate]
+        RMS["RMS check<br/>drop chunks below threshold"]
+    end
+
     subgraph processing [Processing]
-        STT["STT Client<br/>(gRPC or HTTP)"]
-        WW["Wake Word Filter<br/>(IDLE / ACTIVE)"]
+        STT["STT Client<br/>(gRPC streaming)"]
+        CORRECT["STT Text Correction<br/>(Parakeet mishearings)"]
+        FAST["Fast-Path Check<br/>(next/prev step on interims)"]
+        WW["Wake Word Filter<br/>(one-shot: IDLE after dispatch)"]
     end
 
     subgraph output [Output to NAT]
@@ -25,9 +31,13 @@ graph TD
     end
 
     MTX -->|"RTSP pull"| FFMPEG
-    FFMPEG -->|"PCM chunks<br/>100ms intervals"| STT
-    STT -->|"transcription text"| WW
-    WW -->|"filtered text<br/>(wake word stripped)"| WSC
+    FFMPEG -->|"PCM chunks<br/>100ms intervals"| RMS
+    RMS -->|"above threshold"| STT
+    STT -->|"interim + final text"| CORRECT
+    CORRECT -->|"corrected text"| FAST
+    FAST -->|"fast_command<br/>(bypasses LLM)"| WSC
+    CORRECT -->|"final text"| WW
+    WW -->|"user_message<br/>(wake word stripped)"| WSC
 ```
 
 ## Return Path
@@ -35,7 +45,7 @@ graph TD
 ```mermaid
 graph TD
     subgraph natWS [From NAT via WebSocket]
-        AR["agent_response<br/>(tts: true)"]
+        AR["agent_response<br/>(tts: true/false)"]
         DU["display_update"]
         RF["request_frames"]
         WT["wake_timeout"]
@@ -64,16 +74,20 @@ graph TD
 Per-camera entry point. Orchestrates:
 
 1. **FFmpeg audio decoder**: Opens RTSP stream from MediaMTX, decodes to raw PCM (16kHz, mono, s16le), pipes to stdout
-2. **STT streaming**: Chunks PCM at 100ms intervals, sends to configured STT client
-3. **Wake word gate**: Passes transcriptions through the wake word filter
-4. **WebSocket send**: Sends `user_message` to NAT server
-5. **WebSocket receive loop**: Dispatches incoming messages to appropriate handlers
-6. **Frame capture** (Mode 1): On `request_frames`, captures frames from XR socket via `XRServiceConnection.get_latest_frame()`, JPEG-encodes, sends back as `frame_response`
-7. **Audio forwarding** (optional): When `forward_audio: true`, sends raw PCM chunks to NAT as `audio_stream` messages
+2. **Noise gate**: Drops PCM chunks with RMS below `STT_NOISE_GATE_RMS` (default: 250) before they reach the STT model
+3. **STT streaming**: Chunks PCM at 100ms intervals, sends to configured STT client
+4. **STT text correction**: Fixes common Parakeet mishearings of the wake word before any matching
+5. **Fast-path commands**: Detects "stella next step" / "stella previous step" on interim transcriptions and sends `fast_command` immediately, bypassing the accumulator and LLM
+6. **Interim barge-in**: During TTS playback, checks interim text for the wake word and stops TTS immediately
+7. **Wake word gate**: One-shot model -- processes transcription, dispatches command, returns to IDLE
+8. **WebSocket send**: Sends `user_message` or `fast_command` to NAT server
+9. **WebSocket receive loop**: Dispatches incoming messages to appropriate handlers
+10. **Frame capture** (Mode 1): On `request_frames`, captures frames from XR socket, JPEG-encodes, sends back as `frame_response`
+11. **Audio forwarding** (optional): When `forward_audio: true`, sends raw PCM chunks to NAT as `audio_stream` messages
 
 ### `stt_client.py` -- Pluggable STT
 
-Two implementations behind a common interface:
+Multiple implementations behind a common interface:
 
 ```python
 class STTClient(ABC):
@@ -85,29 +99,32 @@ class STTClient(ABC):
 
 | Implementation | Config `speech.stt.protocol` | How it works |
 |---------------|------------------------------|-------------|
-| `GrpcSTTClient` | `grpc` | Streaming gRPC to Riva/NIM Parakeet. Opens a bidirectional stream, sends audio chunks, receives partial and final transcriptions. |
-| `HttpSTTClient` | `http` | POSTs audio chunks to an HTTP endpoint. Simpler but higher latency. |
+| `GrpcSTTClient` | `grpc` | Streaming gRPC to Riva/NIM Parakeet. Opens a bidirectional stream, sends audio chunks, receives partial and final transcriptions. Supports Riva `EndpointingConfig` for tuning `is_final` latency. |
+| `GrpcBatchSTTClient` | `grpc-batch` | Periodic batch recognition for CTC-style engines. |
+| `VllmSTTClient` | `vllm` | OpenAI-compatible audio transcription endpoint. |
+| `ParakeetWsSTTClient` | `parakeet_ws` | Realtime WebSocket protocol with commit loop. |
+| `ElevenLabsSTTClient` | `elevenlabs_realtime` / `elevenlabs` | ElevenLabs Scribe realtime with `pcm_16000`, manual commit cadence, and 500ms speech/silence thresholds. |
+| `FailoverSTTClient` | any protocol with `fallback` | Automatic fallback wrapper with `primary_failed`, `fallback_activated`, and `primary_recovered` lifecycle logs. |
 
 Factory: `create_stt_client(config)` reads `speech.stt.protocol` from config.
 
-### `wakeword.py` -- Wake Word Filter
+### `wakeword.py` -- Wake Word Filter (One-Shot)
 
-Simple state machine extracted and simplified from the old `runtime_connector/filters/wakeword.py`. No Pipecat dependency.
+One-shot state machine: activates on wake word, deactivates immediately after command dispatch or after a short timeout. No persistent session -- every command requires "stella" + command.
 
 ```mermaid
 stateDiagram-v2
     [*] --> IDLE
     IDLE --> ACTIVE: wake word detected
-    ACTIVE --> IDLE: timeout expires
+    ACTIVE --> IDLE: command dispatched (one-shot)
+    ACTIVE --> IDLE: 4s timeout expires
     ACTIVE --> IDLE: sleep command
-    ACTIVE --> ACTIVE: user speaks (reset timer)
-    ACTIVE --> ACTIVE: NAT sends wake_timeout
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Wake words | `["stella", "hey stella"]` | Trigger phrases (case-insensitive) |
-| Timeout | 10 seconds | Auto-deactivate after silence |
+| Timeout | 4 seconds | Auto-deactivate if no command follows wake word |
 | Sleep commands | `["thanks", "goodbye", "go to sleep"]` | Explicit deactivation phrases |
 
 The filter is a pure function:
@@ -128,6 +145,95 @@ Resilient WebSocket client to the NAT server:
   - `display_update` -> Display callback
   - `request_frames` -> Frame capture callback
   - `wake_timeout` -> Wake word timer callback
+
+---
+
+## STT Text Corrections
+
+The `_correct_stt_text()` function in `bridge.py` fixes common Parakeet mishearings of "stella" / "hey stella" before any wake word or fast-path matching. Applied to both interim and final transcriptions.
+
+| Parakeet output | Corrected to |
+|-----------------|-------------|
+| "he's still a" | "hey stella" |
+| "hey still a" | "hey stella" |
+| "hey still" | "hey stella" |
+| "it's still a" | "hey stella" |
+| "is still a" | "hey stella" |
+| "a star a" | "hey stella" |
+| "a star" | "stella" |
+| "it's still" | "stella" |
+| "is still" | "stella" |
+
+**Guard**: Corrections are skipped if the text contains question indicators (`what`, `how`, `why`, `when`, `where`, `which`, `should`, `are we`, `will`, `can`, `do we`, `?`). This prevents correcting legitimate phrases like "is still working?" into "stella working?".
+
+---
+
+## Fast-Path Commands
+
+Certain commands are detected on **interim** (partial) transcriptions and dispatched immediately as `fast_command` messages, bypassing the accumulator debounce and LLM entirely.
+
+| Command | Regex pattern (case-insensitive) |
+|---------|--------------------------------|
+| `next_step` | `(?:stella\|hey\s*stella).*(?:next\s*step\|next\|advance\|skip\|move\s*on)` |
+| `previous_step` | `(?:stella\|hey\s*stella).*(?:previous\s*step\|prev\s*step\|go\s*back\|previous\|back)` |
+
+A question guard prevents fast-path when the text contains question words (`what`, `when`, `how`, etc.).
+
+Flow:
+1. Interim text from STT -> apply `_correct_stt_text()` -> check fast-path regex
+2. If match and no question indicators: send `{"type": "fast_command", "command": "next_step"}` to NAT
+3. Clear accumulator buffer and STT interim, drain pending finals
+4. Deactivate wake word filter (one-shot)
+
+Falls back to checking finals if interims don't trigger.
+
+---
+
+## Disconnect / Reconnect Lifecycle
+
+When glasses disconnect (FFmpeg fails 3 times consecutively), the bridge performs full cleanup and the NAT server resets all session state.
+
+```mermaid
+sequenceDiagram
+    participant Glasses
+    participant Runtime as labos-runtime
+    participant NAT as labos-nat
+
+    Glasses->>Runtime: FFmpeg stream dies (3x)
+    Runtime->>Runtime: Stop STT stream
+    Runtime->>Runtime: Flush accumulator + reset wake word
+    Runtime->>NAT: ws_client.reset_session() (close WS)
+    NAT->>NAT: _cleanup(session_id)
+    Note over NAT: Reset protocol state<br/>Reset context to main_menu<br/>Remove VSOP provider<br/>Cancel running tasks<br/>Clear chat history
+    NAT->>NAT: unregister_ws_connection
+
+    Note over Runtime: Backoff wait...
+
+    Glasses->>Runtime: FFmpeg audio resumes
+    Runtime->>Runtime: Restart STT stream
+    Runtime->>NAT: ws_client auto-reconnects
+    NAT->>NAT: register_ws_connection (fresh session)
+    NAT->>Runtime: render_greeting() (main menu panel)
+```
+
+**Runtime cleanup** (on glasses disconnect):
+- Stop STT stream
+- Flush accumulator buffer
+- Reset wake word filter to IDLE
+- Cancel any pending TTS
+- Reset status to idle/inactive
+
+**NAT cleanup** (on WebSocket disconnect):
+- Stop and remove VSOP provider
+- Reset protocol state (step, errors, data)
+- Reset context manager to `main_menu`
+- Cancel running agent tasks
+- Clear chat history
+
+**Reconnect** (on glasses audio resume):
+- Restart STT stream (fresh gRPC connection)
+- WebSocket auto-reconnects (new clean session)
+- NAT shows greeting panel
 
 ---
 
@@ -157,7 +263,28 @@ This only happens in video Mode 1 (WebSocket). In Modes 2/3, the NAT server read
 | `MEDIAMTX_HOST` | yes | MediaMTX hostname (e.g., `mediamtx`) |
 | `STT_HOST` | yes | STT service hostname |
 | `STT_PORT` | yes | STT service port |
-| `STT_PROTOCOL` | no | `grpc` (default) or `http` |
+| `STT_PROTOCOL` | no | `grpc`, `grpc-batch`, `http`, `vllm`, `parakeet_ws`, `elevenlabs_realtime` (alias: `elevenlabs`) |
+| `STT_MODEL` | no | Model ID for the selected STT provider |
+| `STT_LANGUAGE` | no | Language code for cloud STT providers (default: `en`) |
+| `STT_COMMIT_INTERVAL_S` | no | Manual commit cadence for realtime STT (default: `0.25`) |
+| `STT_MIN_SPEECH_DURATION_MS` | no | Minimum speech duration for VAD commit (default: `500`) |
+| `STT_MIN_SILENCE_DURATION_MS` | no | Minimum silence duration for VAD commit (default: `500`) |
+| `STT_INCLUDE_TIMESTAMPS` | no | Include timestamp events from provider (default: `true`) |
+| `STT_FALLBACK_PROTOCOL` | no | Fallback provider protocol when primary fails |
+| `STT_FALLBACK_HOST` | no | Fallback provider host |
+| `STT_FALLBACK_PORT` | no | Fallback provider port |
+| `STT_FALLBACK_MODEL` | no | Fallback provider model |
+| `STT_FALLBACK_RECOVER_AFTER_S` | no | Delay before retrying primary provider (default: `30`) |
+| `STT_NOISE_CORRECTION_ENABLED` | no | Enable pre-STT RMS noise gate (default: `true`) |
+| `STT_NOISE_GATE_RMS` | no | RMS threshold below which chunks are dropped (default: `250`) |
+| `STT_NOISE_SUPPRESSION_TERMS` | no | Comma-separated transcript terms to suppress as noise |
+| `STT_SPAM_GUARD_WINDOW_S` | no | Dedupe identical utterances within this window (default: `1.0`) |
+| `STT_EP_START_HISTORY` | no | Riva endpointing: speech start history in ms (default: `0` = model default) |
+| `STT_EP_START_THRESHOLD` | no | Riva endpointing: speech start probability threshold (default: `0.0` = model default) |
+| `STT_EP_STOP_HISTORY` | no | Riva endpointing: silence history for is_final in ms (default: `0`). Lower = faster is_final. |
+| `STT_EP_STOP_THRESHOLD` | no | Riva endpointing: silence probability threshold (default: `0.0`) |
+| `STT_EP_STOP_HISTORY_EOU` | no | Riva endpointing: end-of-utterance silence history in ms (default: `0`) |
+| `STT_EP_STOP_THRESHOLD_EOU` | no | Riva endpointing: end-of-utterance silence threshold (default: `0.0`) |
 | `TTS_PUSHER_URL` | yes | TTS pusher base URL (e.g., `http://tts-pusher:5000`) |
 | `DASHBOARD_URL` | yes | Dashboard base URL (e.g., `http://dashboard:5000`) |
 | `SOCKET_PATH` | no | XR socket path (default: `/tmp/xr_service.sock`) |
@@ -168,7 +295,8 @@ This only happens in video Mode 1 (WebSocket). In Modes 2/3, the NAT server read
 | `FRAME_FPS` | no | Frame rate for WS push (default: `15`) |
 | `RTSP_EXTERNAL_HOST` | no | IP/host for RTSP URLs sent to NAT (auto-detected at configure time) |
 | `WAKE_WORDS` | no | Comma-separated wake words (default: `stella,hey stella`) |
-| `WAKE_TIMEOUT` | no | Wake word timeout seconds (default: `10`) |
+| `WAKE_TIMEOUT` | no | Wake word timeout seconds (default: `4`) |
+| `RESET_SESSION_ON_DISCONNECT` | no | Reset NAT session on glasses disconnect (default: `true`) |
 | `LOGURU_LEVEL` | no | Log level (default: `INFO`) |
 
 ---
@@ -203,6 +331,14 @@ To build a full RTSP URL: `{rtsp_base}/{paths.merged}` -> `rtsp://100.93.211.91:
 ```json
 {"type": "user_message", "text": "list some protocols"}
 ```
+
+**`fast_command`** -- Sent when a fast-path command (next/previous step) is detected on interim or final transcription. Bypasses the LLM and directly invokes the protocol tool on NAT.
+
+```json
+{"type": "fast_command", "command": "next_step"}
+```
+
+Valid `command` values: `next_step`, `previous_step`.
 
 **`frame_response`** -- Reply to `request_frames`. Contains base64-encoded JPEG frames.
 
@@ -333,6 +469,45 @@ The preferred way for the NAT server to consume video/audio is via RTSP. On WebS
 4. Individual video-only (`paths.video`) and audio-only (`paths.audio`) streams are also available
 
 The `rtsp_base` host is auto-detected at configure time to be reachable from the NAT server's network (Tailscale-aware).
+
+---
+
+## LabOS Live Session (QR Code Scanning + RTSP Relay)
+
+When `INITIAL_QR_CODE=true`, the bridge starts in QR scanning mode instead of the normal greeting.
+
+### QR Scanning Flow
+
+1. Bridge shows "Point your XR glasses at the QR code" on the AR panel with a live camera preview at ~2 FPS
+2. `cv2.QRCodeDetector` scans each frame for a QR code
+3. When detected, the JSON payload is parsed and validated (`type == "labos_live"`)
+4. The payload is sent to NAT: `{"type": "qr_payload", "payload": {...}}`
+5. NAT connects to the LabOS server WebSocket and replies with `session_connected`
+6. Bridge starts RTSP relay and shows "Connected to session..."
+
+### RTSP Relay
+
+When NAT sends `session_connected` with a `publish_rtsp` URL, the bridge starts an FFmpeg process that copies the local MediaMTX stream to the remote RTSP URL:
+
+```
+ffmpeg -i rtsp://localhost:8554/{local_path} -c copy -f rtsp {publish_rtsp}
+```
+
+The relay is stopped on `session_cleared` or disconnect.
+
+### Session Lifecycle Messages
+
+| Message (NAT -> Runtime) | Purpose |
+|--------------------------|---------|
+| `session_connected` | LabOS session confirmed; includes `publish_rtsp` URL |
+| `session_cleared` | Session ended; stop relay, return to QR scanning |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INITIAL_QR_CODE` | `false` | Enable QR code scanning on startup |
+| `GEMINI_AUDIO_FORWARD` | `false` | Forward raw PCM to Gemini Live session |
 
 ---
 

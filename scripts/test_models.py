@@ -101,7 +101,7 @@ def _test_stt(cfg: dict) -> Optional[TestResult]:
         ok, detail = _vllm_probe(host, port, model)
     elif protocol == "parakeet_ws":
         ok, detail = _parakeet_ws_probe(host, port, model)
-    elif protocol == "elevenlabs":
+    elif protocol in ("elevenlabs", "elevenlabs_realtime"):
         ok, detail = _elevenlabs_stt_probe(stt)
     return TestResult(f"STT ({protocol})", endpoint, ok, detail)
 

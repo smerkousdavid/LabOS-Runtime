@@ -123,7 +123,7 @@ def require_nat(nat_url):
 @pytest.fixture(scope="session")
 def require_stt(stt_config):
     protocol = stt_config.get("protocol", "grpc")
-    if protocol == "elevenlabs":
+    if protocol in ("elevenlabs", "elevenlabs_realtime"):
         if not os.environ.get("ELEVENLABS_API_KEY"):
             pytest.skip("ELEVENLABS_API_KEY not set")
         return

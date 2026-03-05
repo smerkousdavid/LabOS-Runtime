@@ -92,6 +92,16 @@ class WakeWordFilter:
         self._last_activity = time.monotonic()
         return text
 
+    def deactivate(self):
+        """Return to IDLE immediately. Call after a command is dispatched."""
+        self._state = State.IDLE
+        self._last_activity = 0.0
+
+    def reset(self):
+        """Full reset to initial state. Call on glasses disconnect."""
+        self._state = State.IDLE
+        self._last_activity = 0.0
+
     def touch(self):
         """Reset the inactivity timer without changing state.
 

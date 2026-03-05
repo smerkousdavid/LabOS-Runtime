@@ -1,12 +1,12 @@
 """Pluggable STT client implementations.
 
-Supports six backends:
+Supports seven backends:
   - grpc          : Riva StreamingRecognize (for transducer/RNNT models)
   - grpc-batch    : Riva Recognize batch API (for CTC models like Parakeet CTC)
   - http          : Generic HTTP POST (raw PCM body, expects JSON {text: ...})
   - vllm          : vLLM /v1/audio/transcriptions (e.g. Voxtral-Mini)
   - parakeet_ws   : Parakeet WebSocket /v1/realtime (streaming, low-latency)
-  - elevenlabs    : ElevenLabs Scribe realtime WebSocket STT
+  - elevenlabs_realtime / elevenlabs : ElevenLabs Scribe realtime WebSocket STT
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import base64
 import io
 import json
 import struct
+import time
 import wave
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
@@ -45,6 +46,10 @@ class STTClient(ABC):
     async def stop_stream(self) -> None:
         """Close the streaming session."""
 
+    def pop_failure_event(self) -> Optional[dict]:
+        """Optional provider failure signal for failover wrappers."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 # gRPC streaming (Riva StreamingRecognize -- for RNNT/TDT models)
@@ -57,11 +62,19 @@ class GrpcSTTClient(STTClient):
     when available, falling back to locally-compiled stubs (Docker build) if not.
     """
 
-    def __init__(self, host: str, port: int, language: str = "en-US", model: str = ""):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        language: str = "en-US",
+        model: str = "",
+        endpointing: Optional[Dict[str, Any]] = None,
+    ):
         self._host = host
         self._port = port
         self._language = language
         self._model = model
+        self._endpointing = endpointing or {}
         self._channel = None
         self._stub = None
         self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
@@ -83,6 +96,15 @@ class GrpcSTTClient(STTClient):
 
         self._asr_pb2 = asr_pb2
         self._audio_pb2 = audio_pb2
+
+        if self._streaming:
+            await self.stop_stream()
+
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         self._channel = grpc_aio.insecure_channel(
             f"{self._host}:{self._port}",
@@ -136,6 +158,18 @@ class GrpcSTTClient(STTClient):
         )
         if self._model:
             rec_config.model = self._model
+
+        if self._endpointing:
+            ep = asr_pb2.EndpointingConfig()
+            for field in ("start_history", "stop_history", "stop_history_eou"):
+                if field in self._endpointing:
+                    setattr(ep, field, int(self._endpointing[field]))
+            for field in ("start_threshold", "stop_threshold", "stop_threshold_eou"):
+                if field in self._endpointing:
+                    setattr(ep, field, float(self._endpointing[field]))
+            rec_config.endpointing_config.CopyFrom(ep)
+            logger.info(f"[STT] EndpointingConfig: {ep}")
+
         config = asr_pb2.StreamingRecognitionConfig(
             config=rec_config,
             interim_results=True,
@@ -160,6 +194,7 @@ class GrpcSTTClient(STTClient):
             try:
                 logger.info("[STT] Opening gRPC StreamingRecognize stream")
                 responses = self._stub.StreamingRecognize(self._request_generator())
+                self._last_interim = ""
                 async for resp in responses:
                     for result in resp.results:
                         if result.alternatives:
@@ -167,9 +202,13 @@ class GrpcSTTClient(STTClient):
                             if not text:
                                 continue
                             if result.is_final:
+                                self._last_interim = ""
                                 await self._results.put(text)
+                                logger.info(f"[STT] Final: {text}")
                             else:
-                                logger.info(f"[STT] Interim: {text}")
+                                if text != self._last_interim:
+                                    self._last_interim = text
+                                    logger.info(f"[STT] Interim: {text}")
                 backoff = 0.05
             except asyncio.CancelledError:
                 break
@@ -179,6 +218,10 @@ class GrpcSTTClient(STTClient):
                 logger.warning(f"[STT] gRPC stream error: {exc}; retrying in {backoff:.2f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 0.5)
+
+    def get_last_interim(self) -> str:
+        """Return the most recent interim transcription (non-blocking)."""
+        return getattr(self, "_last_interim", "")
 
 
 # ---------------------------------------------------------------------------
@@ -603,27 +646,38 @@ class ParakeetWsSTTClient(STTClient):
 class ElevenLabsSTTClient(STTClient):
     """Streaming STT via ElevenLabs Scribe v2 realtime WebSocket.
 
-    Sends base64 PCM16 chunks as ``input_audio_chunk`` messages (commit=False).
-    ElevenLabs Scribe uses its own VAD to detect speech boundaries and returns
-    ``partial_transcript`` / ``committed_transcript`` automatically -- no
-    explicit commit messages are needed.
+    Sends base64 PCM16 chunks as ``input_audio_chunk`` messages and performs
+    explicit periodic commits when using ``commit_strategy=manual``.
     """
 
-    COMMIT_INTERVAL = 3.0  # kept for test compat; not used at runtime
+    COMMIT_INTERVAL = 0.25
     WS_URL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime"
 
     def __init__(self, api_key: str, model: str = "scribe_v2_realtime",
-                 language: str = "en"):
+                 language: str = "en", commit_interval_s: float = 0.25,
+                 min_speech_duration_ms: int = 500,
+                 min_silence_duration_ms: int = 500,
+                 include_timestamps: bool = True):
         self._api_key = api_key
         self._model = model
         self._language = language
+        self._commit_interval_s = max(0.1, float(commit_interval_s))
+        self._min_speech_duration_ms = max(0, int(min_speech_duration_ms))
+        self._min_silence_duration_ms = max(0, int(min_silence_duration_ms))
+        self._include_timestamps = bool(include_timestamps)
+        self._commit_strategy = "manual"
         self._ws = None
         self._results: asyncio.Queue[str] = asyncio.Queue()
         self._running = False
         self._ws_task: Optional[asyncio.Task] = None
+        self._bytes_since_commit = 0
+        self._bytes_per_commit = int(SAMPLE_RATE * BYTES_PER_SAMPLE * self._commit_interval_s)
+        self._last_commit_ts = 0.0
+        self._last_emitted_text = ""
+        self._last_emitted_ts = 0.0
+        self._failure_events: asyncio.Queue[dict] = asyncio.Queue()
         self._has_audio = False
         self._audio_lock = asyncio.Lock()
-        self._chunks_sent = 0
 
     async def start_stream(self) -> None:
         self._running = True
@@ -633,16 +687,29 @@ class ElevenLabsSTTClient(STTClient):
     async def send_audio(self, pcm_chunk: bytes) -> None:
         async with self._audio_lock:
             self._has_audio = True
-            self._chunks_sent += 1
+            self._bytes_since_commit += len(pcm_chunk)
         if self._ws and self._running:
             b64 = base64.b64encode(pcm_chunk).decode("ascii")
+            now = time.monotonic()
+            should_commit = (
+                self._commit_strategy == "manual"
+                and
+                self._bytes_since_commit >= self._bytes_per_commit
+                and (self._last_commit_ts == 0.0 or (now - self._last_commit_ts) >= self._commit_interval_s)
+            )
+            if should_commit:
+                self._bytes_since_commit = 0
+                self._last_commit_ts = now
             try:
-                await self._ws.send(json.dumps({
+                payload = {
                     "message_type": "input_audio_chunk",
                     "audio_base_64": b64,
-                    "commit": False,
                     "sample_rate": SAMPLE_RATE,
-                }))
+                }
+                # In VAD mode, do not send explicit commit hints.
+                if self._commit_strategy == "manual":
+                    payload["commit"] = should_commit
+                await self._ws.send(json.dumps(payload))
             except Exception:
                 pass
 
@@ -654,6 +721,8 @@ class ElevenLabsSTTClient(STTClient):
 
     async def stop_stream(self) -> None:
         self._running = False
+        self._bytes_since_commit = 0
+        self._last_commit_ts = 0.0
         if self._ws_task:
             self._ws_task.cancel()
             try:
@@ -670,7 +739,15 @@ class ElevenLabsSTTClient(STTClient):
     async def _ws_loop(self):
         import websockets
 
-        url = f"{self.WS_URL}?model_id={self._model}"
+        url = (
+            f"{self.WS_URL}?model_id={self._model}"
+            f"&language_code={self._language}"
+            f"&audio_format=pcm_16000"
+            f"&commit_strategy={self._commit_strategy}"
+            f"&min_speech_duration_ms={self._min_speech_duration_ms}"
+            f"&min_silence_duration_ms={self._min_silence_duration_ms}"
+            f"&include_timestamps={'true' if self._include_timestamps else 'false'}"
+        )
         headers = {"xi-api-key": self._api_key}
         backoff = 0.5
 
@@ -704,29 +781,57 @@ class ElevenLabsSTTClient(STTClient):
                         event = json.loads(raw)
                         mtype = event.get("message_type", "")
                         if mtype == "committed_transcript":
-                            text = event.get("text", "").strip()
-                            if text:
-                                await self._results.put(text)
+                            # When timestamps are enabled, this is usually duplicated by
+                            # committed_transcript_with_timestamps; prefer the timestamped one.
+                            if not self._include_timestamps:
+                                text = event.get("text", "").strip()
+                                if self._should_emit_text(text):
+                                    await self._results.put(text)
                         elif mtype == "committed_transcript_with_timestamps":
                             text = event.get("text", "").strip()
-                            if text:
+                            if self._should_emit_text(text):
                                 await self._results.put(text)
                         elif mtype == "partial_transcript":
                             pass
                         elif mtype == "input_error":
-                            logger.warning(f"[STT] ElevenLabs input error: {event}")
+                            err_text = json.dumps(event)
+                            logger.warning(f"[STT] ElevenLabs input error: {err_text}")
+                            if any(t in err_text.lower() for t in ("auth", "unauthorized", "rate", "quota")):
+                                await self._failure_events.put({
+                                    "event": "primary_failed",
+                                    "provider": "elevenlabs_realtime",
+                                    "reason": "input_error",
+                                    "detail": err_text[:200],
+                                })
                         else:
                             logger.debug(f"[STT] ElevenLabs event: {mtype}")
 
                     code = ws.close_code
                     reason = ws.close_reason or ""
                     logger.info(f"[STT] ElevenLabs WS closed (code={code} reason={reason})")
+                    if "commit_throttled" in reason:
+                        # Keep manual strategy, but reduce commit frequency to match provider limits.
+                        self._commit_interval_s = min(self._commit_interval_s * 1.5, 2.0)
+                        self._bytes_per_commit = int(SAMPLE_RATE * BYTES_PER_SAMPLE * self._commit_interval_s)
+                        self._bytes_since_commit = 0
+                        logger.warning(
+                            f"[STT] ElevenLabs commit throttled; keeping manual strategy and "
+                            f"backing off commit_interval_s={self._commit_interval_s:.2f}"
+                        )
 
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 if not self._running:
                     break
+                err = str(exc).lower()
+                if any(t in err for t in ("401", "403", "429", "auth", "rate", "quota", "socket")):
+                    await self._failure_events.put({
+                        "event": "primary_failed",
+                        "provider": "elevenlabs_realtime",
+                        "reason": type(exc).__name__,
+                        "detail": str(exc)[:200],
+                    })
                 logger.warning(f"[STT] ElevenLabs WS error: {type(exc).__name__}: {exc}; "
                                f"reconnecting in {backoff:.1f}s")
             finally:
@@ -734,6 +839,158 @@ class ElevenLabsSTTClient(STTClient):
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 5.0)
+
+    def pop_failure_event(self) -> Optional[dict]:
+        try:
+            return self._failure_events.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    def _should_emit_text(self, text: str) -> bool:
+        text = text.strip()
+        if not text:
+            return False
+        now = time.monotonic()
+        if text == self._last_emitted_text and (now - self._last_emitted_ts) < 1.0:
+            return False
+        self._last_emitted_text = text
+        self._last_emitted_ts = now
+        return True
+
+
+class FailoverSTTClient(STTClient):
+    """Primary/fallback STT wrapper with automatic failover and recovery."""
+
+    def __init__(
+        self,
+        primary: STTClient,
+        fallback: STTClient,
+        primary_label: str,
+        fallback_label: str,
+        recover_after_s: float = 30.0,
+    ):
+        self._primary = primary
+        self._fallback = fallback
+        self._primary_label = primary_label
+        self._fallback_label = fallback_label
+        self._recover_after_s = max(5.0, float(recover_after_s))
+        self._active = "primary"
+        self._last_primary_failure = 0.0
+        self._primary_running = False
+        self._fallback_running = False
+
+    async def start_stream(self) -> None:
+        try:
+            await self._primary.start_stream()
+            self._primary_running = True
+            self._active = "primary"
+            logger.info(f"[STT] provider_active provider={self._primary_label}")
+        except Exception as exc:
+            self._primary_running = False
+            self._last_primary_failure = asyncio.get_running_loop().time()
+            logger.warning(
+                f"[STT] primary_failed provider={self._primary_label} "
+                f"detail={type(exc).__name__}:{exc}"
+            )
+            await self._start_fallback()
+
+    async def send_audio(self, pcm_chunk: bytes) -> None:
+        await self._maybe_handle_primary_failure_signal()
+        await self._maybe_recover_primary()
+        if self._active == "fallback":
+            await self._fallback.send_audio(pcm_chunk)
+            return
+        try:
+            await self._primary.send_audio(pcm_chunk)
+        except Exception as exc:
+            await self._activate_fallback(exc)
+            await self._fallback.send_audio(pcm_chunk)
+
+    async def get_transcription(self) -> Optional[str]:
+        await self._maybe_handle_primary_failure_signal()
+        await self._maybe_recover_primary()
+        if self._active == "fallback":
+            return await self._fallback.get_transcription()
+        try:
+            return await self._primary.get_transcription()
+        except Exception as exc:
+            await self._activate_fallback(exc)
+            return await self._fallback.get_transcription()
+
+    async def stop_stream(self) -> None:
+        errors = []
+        if self._primary_running:
+            try:
+                await self._primary.stop_stream()
+            except Exception as exc:
+                errors.append(exc)
+            self._primary_running = False
+        if self._fallback_running:
+            try:
+                await self._fallback.stop_stream()
+            except Exception as exc:
+                errors.append(exc)
+            self._fallback_running = False
+        if errors:
+            logger.debug(f"[STT] stop_stream saw errors: {errors}")
+
+    async def _start_fallback(self) -> None:
+        if not self._fallback_running:
+            await self._fallback.start_stream()
+            self._fallback_running = True
+        self._active = "fallback"
+        logger.warning(f"[STT] fallback_activated provider={self._fallback_label}")
+
+    async def _activate_fallback(self, exc: Exception) -> None:
+        self._last_primary_failure = asyncio.get_running_loop().time()
+        logger.warning(
+            f"[STT] primary_failed provider={self._primary_label} "
+            f"detail={type(exc).__name__}:{exc}"
+        )
+        if self._primary_running:
+            try:
+                await self._primary.stop_stream()
+            except Exception:
+                pass
+            self._primary_running = False
+        await self._start_fallback()
+
+    async def _maybe_recover_primary(self) -> None:
+        if self._active != "fallback":
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._last_primary_failure < self._recover_after_s:
+            return
+        try:
+            await self._primary.start_stream()
+            self._primary_running = True
+            if self._fallback_running:
+                await self._fallback.stop_stream()
+                self._fallback_running = False
+            self._active = "primary"
+            logger.info(f"[STT] primary_recovered provider={self._primary_label}")
+        except Exception as exc:
+            self._last_primary_failure = now
+            logger.debug(f"[STT] primary_recovery_failed detail={type(exc).__name__}:{exc}")
+
+    async def _maybe_handle_primary_failure_signal(self) -> None:
+        if self._active != "primary":
+            return
+        signal = self._primary.pop_failure_event()
+        if not signal:
+            return
+        self._last_primary_failure = asyncio.get_running_loop().time()
+        logger.warning(
+            f"[STT] primary_failed provider={signal.get('provider', self._primary_label)} "
+            f"reason={signal.get('reason', 'unknown')} detail={signal.get('detail', '')}"
+        )
+        if self._primary_running:
+            try:
+                await self._primary.stop_stream()
+            except Exception:
+                pass
+            self._primary_running = False
+        await self._start_fallback()
 
 
 # ---------------------------------------------------------------------------
@@ -749,34 +1006,64 @@ def create_stt_client(config: Dict[str, Any]) -> STTClient:
       http         - generic HTTP POST with raw PCM body
       vllm         - vLLM /v1/audio/transcriptions (Voxtral, Whisper, etc.)
       parakeet_ws  - Parakeet WebSocket /v1/realtime (streaming)
-      elevenlabs   - ElevenLabs Scribe realtime WebSocket STT
+      elevenlabs / elevenlabs_realtime - ElevenLabs realtime WebSocket STT
     """
     import os
 
     stt_cfg = config if "protocol" in config else config.get("speech", {}).get("stt", {})
-    protocol = stt_cfg.get("protocol", "grpc")
+    protocol_raw = stt_cfg.get("protocol", "grpc")
+    protocol = "elevenlabs_realtime" if protocol_raw == "elevenlabs" else protocol_raw
     host = stt_cfg.get("host", "stt-service")
     port = int(stt_cfg.get("port", 50051))
     model = stt_cfg.get("model", "")
 
-    if protocol == "grpc":
-        return GrpcSTTClient(host, port, model=model)
-    elif protocol == "grpc-batch":
-        return GrpcBatchSTTClient(host, port, model=model)
-    elif protocol == "vllm":
-        return VllmSTTClient(host, port, model=model)
-    elif protocol == "parakeet_ws":
-        return ParakeetWsSTTClient(host, port, model=model)
-    elif protocol == "elevenlabs":
-        api_key = stt_cfg.get("api_key") or os.environ.get("ELEVENLABS_API_KEY", "")
-        if not api_key:
-            raise ValueError("ELEVENLABS_API_KEY required for elevenlabs STT")
-        return ElevenLabsSTTClient(
-            api_key=api_key,
-            model=model or "scribe_v2_realtime",
-        )
-    elif protocol == "http":
-        url = f"http://{host}:{port}/transcribe"
-        return HttpSTTClient(url)
-    else:
-        raise ValueError(f"Unknown STT protocol: {protocol}")
+    def _build_client(stt_protocol: str, cfg: Dict[str, Any]) -> STTClient:
+        p = "elevenlabs_realtime" if stt_protocol == "elevenlabs" else stt_protocol
+        h = cfg.get("host", host)
+        prt = int(cfg.get("port", port))
+        mdl = cfg.get("model", model)
+        if p == "grpc":
+            return GrpcSTTClient(h, prt, model=mdl, endpointing=cfg.get("endpointing"))
+        elif p == "grpc-batch":
+            return GrpcBatchSTTClient(h, prt, model=mdl)
+        elif p == "vllm":
+            return VllmSTTClient(h, prt, model=mdl)
+        elif p == "parakeet_ws":
+            return ParakeetWsSTTClient(h, prt, model=mdl)
+        elif p == "elevenlabs_realtime":
+            api_key = cfg.get("api_key") or os.environ.get("ELEVENLABS_API_KEY", "")
+            if not api_key:
+                raise ValueError("ELEVENLABS_API_KEY required for elevenlabs_realtime STT")
+            return ElevenLabsSTTClient(
+                api_key=api_key,
+                model=mdl or "scribe_v2_realtime",
+                language=cfg.get("language", "en"),
+                commit_interval_s=float(cfg.get("commit_interval_s", 0.25)),
+                min_speech_duration_ms=int(cfg.get("min_speech_duration_ms", 500)),
+                min_silence_duration_ms=int(cfg.get("min_silence_duration_ms", 500)),
+                include_timestamps=bool(cfg.get("include_timestamps", True)),
+            )
+        elif p == "http":
+            url = f"http://{h}:{prt}/transcribe"
+            return HttpSTTClient(url)
+        raise ValueError(f"Unknown STT protocol: {stt_protocol}")
+
+    primary = _build_client(protocol, stt_cfg)
+    fallback_cfg = stt_cfg.get("fallback", {})
+    fallback_protocol = fallback_cfg.get("protocol")
+    if not fallback_protocol:
+        logger.info(f"[STT] provider_selected provider={protocol}")
+        return primary
+
+    fallback = _build_client(fallback_protocol, fallback_cfg)
+    logger.info(
+        f"[STT] provider_selected provider={protocol} "
+        f"fallback_provider={fallback_protocol}"
+    )
+    return FailoverSTTClient(
+        primary=primary,
+        fallback=fallback,
+        primary_label=protocol,
+        fallback_label=fallback_protocol,
+        recover_after_s=float(stt_cfg.get("fallback_recover_after_s", 30)),
+    )
