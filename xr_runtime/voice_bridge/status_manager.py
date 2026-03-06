@@ -1,14 +1,14 @@
 """COMPONENTS_STATUS manager for the voice bridge.
 
 Tracks the current state of Voice_Assistant, Server_Connection, and
-Robot_Status.  Sends COMPONENTS_STATUS messages to glasses via the
-dashboard API whenever state changes.
+Robot_Status.  Sends COMPONENTS_STATUS messages to glasses via a
+caller-provided async send function.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 
@@ -16,8 +16,8 @@ from loguru import logger
 class StatusManager:
     """Track and broadcast COMPONENTS_STATUS to the XR glasses."""
 
-    def __init__(self, dashboard_url: str):
-        self._dashboard_url = dashboard_url
+    def __init__(self, send_fn: Callable[[str, str], Awaitable[bool]]):
+        self._send_fn = send_fn
         self.voice_assistant: str = "idle"
         self.server_connection: str = "inactive"
         self.robot_status: str = "N/A"
@@ -41,22 +41,31 @@ class StatusManager:
 
         payload = self._payload()
         if payload != self._last_sent:
-            await self._push(payload)
+            sent = await self._push(payload)
+            if sent:
+                self._last_sent = payload.copy()
+        return payload
+
+    async def force_push(self):
+        """Push current status regardless of _last_sent (e.g. after reconnect)."""
+        payload = self._payload()
+        sent = await self._push(payload)
+        if sent:
             self._last_sent = payload.copy()
         return payload
 
-    async def _push(self, payload: dict):
-        """POST COMPONENTS_STATUS to the dashboard."""
-        import httpx
+    async def _push(self, payload: dict) -> bool:
+        """Send COMPONENTS_STATUS to the glasses via the bridge's send function.
+
+        Returns True if the send function reported success.
+        """
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                await client.post(
-                    f"{self._dashboard_url}/api/send_message",
-                    json={
-                        "message_type": "COMPONENTS_STATUS",
-                        "payload": json.dumps(payload),
-                    },
-                )
-            logger.debug(f"[Status] Pushed: {payload}")
+            result = await self._send_fn("COMPONENTS_STATUS", json.dumps(payload))
+            if result:
+                logger.debug(f"[Status] Pushed: {payload}")
+                return True
+            logger.debug(f"[Status] Push deferred (connection not ready): {payload}")
+            return False
         except Exception as exc:
             logger.warning(f"[Status] Failed to push status: {exc}")
+            return False

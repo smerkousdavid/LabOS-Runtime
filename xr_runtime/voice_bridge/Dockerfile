@@ -4,6 +4,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libzbar0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY voice_bridge/requirements.txt .

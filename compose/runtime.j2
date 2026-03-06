@@ -25,9 +25,6 @@ services:
     volumes:
       - ./xr_runtime/streaming/mediamtx.yml:/mediamtx.yml
       - ./logs/mediamtx:/logs
-{% if recording_enabled %}
-      - {{ recordings_path }}:/recordings
-{% endif %}
 {% endif %}
 
   # ===========================================================================
@@ -44,7 +41,7 @@ services:
       - xr_socket_{{ i+1 }}:/tmp
       - ./logs/grpc_{{ i+1 }}:/logs
     working_dir: /home/gRPC_server
-    entrypoint: ["/home/gRPC_server/main.bin"]
+    entrypoint: ["/home/gRPC_server/main.bin", "--grpc-port", "{{ base_ports.GRPC_PORT + i }}"]
     restart: unless-stopped
     logging: *default-logging
     container_name: labos_grpc_{{ i+1 }}
@@ -124,12 +121,18 @@ services:
       - ./logs/voice_bridge_{{ i+1 }}:/app/logs
       - ./protocols:/app/protocols:ro
       - ./xr_runtime/voice_bridge/tool_filter.yaml:/app/tool_filter.yaml:ro
+{% if recording_enabled %}
+      - {{ recordings_path }}:/app/recordings
+{% endif %}
     env_file: .env
     environment:
       - NAT_SERVER_URL={{ nat_server_url }}
       - CAMERA_INDEX={{ i+1 }}
       - SESSION_ID=demo-{{ i+1 }}
       - MEDIAMTX_HOST={{ mediamtx_service_name }}
+      - RECORDING_ENABLED={{ 'true' if recording_enabled else 'false' }}
+      - RECORDINGS_PATH=/app/recordings
+      - RECORDING_FPS={{ recording_fps }}
       - STT_HOST={{ stt_host }}
       - STT_PORT={{ stt_port }}
       - STT_PROTOCOL={{ stt_protocol }}

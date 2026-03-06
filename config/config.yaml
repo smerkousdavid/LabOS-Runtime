@@ -11,13 +11,13 @@
 # Set this to the WebSocket URL of your NAT server.
 # ---------------------------------------------------------------------------
 nat_server:
-  url: "ws://localhost:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+  url: "ws://100.102.174.60:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
 
 # ---------------------------------------------------------------------------
 # XR Runtime -- streaming, video, gRPC
 # ---------------------------------------------------------------------------
 runtime:
-  num_cameras: 1
+  num_cameras: 2
   streaming:
     method: mediamtx                      # mediamtx | gstreamer
     framerate: 30
@@ -31,7 +31,7 @@ runtime:
 speech:
   stt:
     protocol: grpc                          # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs_realtime
-    host: "localhost"
+    host: "100.102.174.60"
     port: 50051
     model: "parakeet-1.1b-en-US-asr-streaming"
     # language: "en"
@@ -80,7 +80,7 @@ speech:
       base_url: https://dashscope.aliyuncs.com/api/v1
       api_key_env: DASHSCOPE_API_KEY
     vibevoice:
-      host: "localhost"                   # TTS server hostname or IP
+      host: "100.102.174.60"                   # TTS server hostname or IP
       port: 8050
     elevenlabs:
       voice_id: "pNInz6obpgDQGcFmaJgB"       # Adam pre-made voice
@@ -126,7 +126,7 @@ frame_streaming:
 # LabOS Live Session -- QR code scanning and RTSP relay
 # ---------------------------------------------------------------------------
 labos_live:
-  initial_qr_code: false                  # show QR scanning prompt on XR startup
+  initial_qr_code: true                  # show QR scanning prompt on XR startup
 
 # ---------------------------------------------------------------------------
 # RTSP external access
@@ -135,13 +135,12 @@ rtsp:
   external_host: "auto"                   # "auto" detects Tailscale/LAN IP; or set a fixed IP
 
 # ---------------------------------------------------------------------------
-# Recording -- MediaMTX auto-records when glasses connect
+# Recording -- session video, chat, and logs written by voice bridge
 # ---------------------------------------------------------------------------
 recording:
-  enabled: true                           # record streams when active
-  format: fmp4                            # fmp4 | mpegts
-  segment_duration: 60m                   # segment duration (e.g., 60m, 1h)
+  enabled: true                           # record sessions when glasses connect
   path: "./recordings"                    # host-side path for recorded files
+  framerate: 15                           # recording FPS (lower than streaming to save space)
 
 # ---------------------------------------------------------------------------
 # Wake word settings (for voice bridge)

@@ -87,6 +87,7 @@ def main():
         "reset_session": os.environ.get("RESET_SESSION_ON_DISCONNECT", "false"),
         "recording_enabled": os.environ.get("RECORDING_ENABLED", "false").lower() in ("1", "true", "yes"),
         "recordings_path": os.environ.get("RECORDINGS_PATH", "./recordings"),
+        "recording_fps": os.environ.get("RECORDING_FPS", "15"),
         "ENABLE_ROBOT": os.environ.get("ENABLE_ROBOT", "false").lower() in ("1", "true", "yes"),
         "xarm_ip": os.environ.get("XARM_IP", "192.168.1.185"),
         "robot_session_id": os.environ.get("ROBOT_SESSION_ID", "robot-1"),

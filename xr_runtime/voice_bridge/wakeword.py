@@ -6,9 +6,10 @@ No Pipecat dependency -- pure function interface.
 
 from __future__ import annotations
 
+import re
 import time
 from enum import Enum
-from typing import List, Optional
+from typing import FrozenSet, List, Optional, Set
 
 
 class State(str, Enum):
@@ -18,6 +19,12 @@ class State(str, Enum):
 
 _STOP_COMMANDS = frozenset({"stop", "quiet", "shut up", "be quiet", "stop talking"})
 
+_SHORTCUT_COMMANDS = frozenset({
+    "next", "next step", "previous", "previous step", "continue",
+    "stop", "quit", "explain", "clear", "move on", "quiet",
+    "shut up", "please stop", "explain step",
+})
+
 
 class WakeWordFilter:
     def __init__(
@@ -25,10 +32,12 @@ class WakeWordFilter:
         wake_words: Optional[List[str]] = None,
         timeout_seconds: float = 10.0,
         sleep_commands: Optional[List[str]] = None,
+        noise_words: Optional[FrozenSet[str]] = None,
     ):
         self._wake_words = [w.lower() for w in (wake_words or ["stella", "hey stella"])]
         self._sleep_commands = [c.lower() for c in (sleep_commands or ["thanks", "goodbye", "go to sleep"])]
         self._timeout = timeout_seconds
+        self._noise_words: Set[str] = {w.lower() for w in (noise_words or set())}
         self._state = State.IDLE
         self._last_activity = 0.0
 
@@ -56,10 +65,25 @@ class WakeWordFilter:
         """Return True if *text* is a TTS stop/interrupt command."""
         return text.strip().lower().rstrip(".!") in _STOP_COMMANDS
 
+    def _strip_noise(self, text: str) -> str:
+        """Remove noise filler words and collapse whitespace."""
+        if not self._noise_words:
+            return text
+        words = text.split()
+        cleaned = [w for w in words if w.lower().rstrip(".,!?") not in self._noise_words]
+        return " ".join(cleaned).strip()
+
+    def is_shortcut_command(self, text: str) -> bool:
+        """Return True if *text* (after noise stripping) is an exact shortcut command."""
+        stripped = self._strip_noise(text).lower().rstrip(".!?,")
+        return stripped in _SHORTCUT_COMMANDS
+
     def process(self, transcription: str) -> Optional[str]:
         """Process a transcription. Returns cleaned text if active, None if filtered.
 
         If a wake word is detected, strips it and activates.
+        If the text (after noise stripping) is an exact shortcut command,
+        activates and returns the command even without a wake word.
         If already active, resets the timeout timer and passes text through.
         If a sleep command is detected while active, deactivates and returns None.
         """
@@ -77,6 +101,12 @@ class WakeWordFilter:
                 cleaned = text[len(ww):].strip()
                 cleaned = cleaned.lstrip(",").lstrip(".").strip()
                 return cleaned if cleaned else None
+
+        # Shortcut commands bypass wake word when IDLE
+        stripped = self._strip_noise(text)
+        if stripped.lower().rstrip(".!?,") in _SHORTCUT_COMMANDS:
+            self._activate()
+            return stripped
 
         # If not active (or timed out), filter out
         if self.state != State.ACTIVE:

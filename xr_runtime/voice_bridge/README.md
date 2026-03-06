@@ -476,31 +476,113 @@ The `rtsp_base` host is auto-detected at configure time to be reachable from the
 
 When `INITIAL_QR_CODE=true`, the bridge starts in QR scanning mode instead of the normal greeting.
 
-### QR Scanning Flow
+### Architecture
 
-1. Bridge shows "Point your XR glasses at the QR code" on the AR panel with a live camera preview at ~2 FPS
-2. `cv2.QRCodeDetector` scans each frame for a QR code
-3. When detected, the JSON payload is parsed and validated (`type == "labos_live"`)
-4. The payload is sent to NAT: `{"type": "qr_payload", "payload": {...}}`
-5. NAT connects to the LabOS server WebSocket and replies with `session_connected`
-6. Bridge starts RTSP relay and shows "Connected to session..."
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  XR Glasses                                                         │
+│  ┌──────────┐            ┌────────────────────┐                     │
+│  │  Camera   │────video──▸│  gRPC Server       │                    │
+│  │  (RGB)    │   frames   │  (per-camera)      │                    │
+│  └──────────┘            └────────┬───────────┘                     │
+│  ┌──────────┐                     │                                  │
+│  │  Display  │◂──────────────┐    │  get_latest_frame()             │
+│  │  (AR)     │  send_message │    │                                  │
+│  └──────────┘               │    ▼                                  │
+└─────────────────────────────┼────────────────────────────────────────┘
+                              │
+┌─────────────────────────────┼────────────────────────────────────────┐
+│  Voice Bridge               │                                        │
+│                             │                                        │
+│  ┌──────────────────────────┴───────────────────────────┐           │
+│  │  _qr_scan_task  (async, ~2 FPS)                      │           │
+│  │                                                       │           │
+│  │  1. Fetch frame from XR connection                    │           │
+│  │  2. Decode QR with pyzbar (or cv2 fallback)           │           │
+│  │  3. Log ALL decoded payloads                          │           │
+│  │  4. Parse JSON and match type == "labos_live"         │           │
+│  │  5. Send display update directly to glasses           │           │
+│  │     (camera preview + "Point at the QR code" text)    │           │
+│  │     (or text-only "Waiting for camera..." if no frame)│           │
+│  └──────────────────────────┬───────────────────────────┘           │
+│                             │                                        │
+│                             │ on match: ws_client.send(qr_payload)   │
+│                             ▼                                        │
+│  ┌───────────────────────────────────────────────────────┐           │
+│  │  WebSocket to NAT Server                              │           │
+│  │  {"type": "qr_payload", "payload": {QR JSON}}         │           │
+│  └──────────────────────────┬───────────────────────────┘           │
+└─────────────────────────────┼────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  NAT Server                                                         │
+│                                                                      │
+│  Receives qr_payload ──▸ connects to LabOS Live server               │
+│                     ◂── responds with session_connected              │
+│                          {publish_rtsp: "rtsp://...", session_id: …} │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Voice Bridge: _handle_session_connected                            │
+│                                                                      │
+│  1. stop_qr_scanning()  -- stop the scan task                        │
+│  2. Start FFmpeg RTSP relay:                                         │
+│     ffmpeg -i rtsp://mediamtx:8554/{local} -c copy -f rtsp {remote} │
+│                                                                      │
+│  On session_cleared:                                                 │
+│  1. Stop RTSP relay                                                  │
+│  2. Restart QR scanning (if INITIAL_QR_CODE is true)                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### QR Code Payload Format
+
+The QR code must encode a JSON string. Example:
+
+```json
+{"type": "labos_live", "session_id": "abc-123", "server": "wss://live.labos.io"}
+```
+
+**Required field:** `"type": "labos_live"` -- the bridge matches on this to distinguish LabOS QR codes from arbitrary ones.
+
+If the scanned QR contains a non-JSON raw string, it is wrapped as `{"type": "labos_live", "raw": "<string>"}` and forwarded to NAT.
+
+### QR Scanning Flow (detailed)
+
+1. `_qr_scan_task` starts as an async task at bridge startup
+2. Every 0.5s, it fetches the latest camera frame via `_get_xr_connection().get_latest_frame()`
+3. If no frame is available (glasses not connected or camera not streaming), a text-only panel ("Point at the QR code on screen" / "Waiting for camera...") is sent directly to the glasses via `_send_to_glasses()`
+4. When a frame is available:
+   - The frame is resized to max 480px for faster processing
+   - **pyzbar** (`pyzbar.pyzbar.decode` with `ZBarSymbol.QRCODE`) decodes all QR codes in the frame
+   - If pyzbar is unavailable, falls back to `cv2.QRCodeDetector.detectAndDecodeMulti()`
+   - **Every decoded payload is logged** (`[QR] Decoded payload: ...`) for debugging
+5. The decoded string is parsed as JSON:
+   - If valid JSON with `type == "labos_live"`: match found, send `qr_payload` to NAT
+   - If valid JSON but different type: logged and skipped (`[QR] Ignoring QR -- type=...`)
+   - If not valid JSON: treated as a raw string, wrapped, and forwarded
+6. On match, scanning stops (`_qr_scanning_active = False`)
+7. NAT processes the payload and responds with `session_connected`
 
 ### RTSP Relay
 
 When NAT sends `session_connected` with a `publish_rtsp` URL, the bridge starts an FFmpeg process that copies the local MediaMTX stream to the remote RTSP URL:
 
 ```
-ffmpeg -i rtsp://localhost:8554/{local_path} -c copy -f rtsp {publish_rtsp}
+ffmpeg -i rtsp://mediamtx:8554/{local_path} -c copy -f rtsp {publish_rtsp}
 ```
 
 The relay is stopped on `session_cleared` or disconnect.
 
 ### Session Lifecycle Messages
 
-| Message (NAT -> Runtime) | Purpose |
-|--------------------------|---------|
-| `session_connected` | LabOS session confirmed; includes `publish_rtsp` URL |
-| `session_cleared` | Session ended; stop relay, return to QR scanning |
+| Message | Direction | Purpose |
+|---------|-----------|---------|
+| `qr_payload` | Runtime -> NAT | Scanned QR payload forwarded to NAT for processing |
+| `session_connected` | NAT -> Runtime | LabOS session confirmed; includes `publish_rtsp` URL |
+| `session_cleared` | NAT -> Runtime | Session ended; stop relay, return to QR scanning |
 
 ### Environment Variables
 
@@ -509,8 +591,12 @@ The relay is stopped on `session_cleared` or disconnect.
 | `INITIAL_QR_CODE` | `false` | Enable QR code scanning on startup |
 | `GEMINI_AUDIO_FORWARD` | `false` | Forward raw PCM to Gemini Live session |
 
+### Dependencies
+
+QR decoding uses [pyzbar](https://pypi.org/project/pyzbar/) (requires `libzbar0` system library) as the primary decoder, with OpenCV's `QRCodeDetector` as a fallback if pyzbar is not available.
+
 ---
 
 ## Dockerfile
 
-Based on `python:3.11.14-slim-bookworm` with FFmpeg. Installs `websockets`, `grpcio`, `loguru`, `httpx`, `opencv-python-headless`, `numpy`, and the `xr_service_library` wheel.
+Based on `python:3.11.14-slim-bookworm` with FFmpeg and libzbar0. Installs `websockets`, `grpcio`, `loguru`, `httpx`, `opencv-python-headless`, `numpy`, `pyzbar`, and the `xr_service_library` wheel.
