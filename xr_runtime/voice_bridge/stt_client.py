@@ -46,6 +46,9 @@ class STTClient(ABC):
     async def stop_stream(self) -> None:
         """Close the streaming session."""
 
+    async def clear_buffer(self) -> None:
+        """Discard any pending audio in the server-side buffer (drift reset)."""
+
     def pop_failure_event(self) -> Optional[dict]:
         """Optional provider failure signal for failover wrappers."""
         return None
@@ -77,7 +80,7 @@ class GrpcSTTClient(STTClient):
         self._endpointing = endpointing or {}
         self._channel = None
         self._stub = None
-        self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._audio_queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=50)
         self._results: asyncio.Queue[str] = asyncio.Queue()
         self._reader_task: Optional[asyncio.Task] = None
         self._streaming = False
@@ -120,6 +123,11 @@ class GrpcSTTClient(STTClient):
 
     async def send_audio(self, pcm_chunk: bytes) -> None:
         if self._streaming:
+            if self._audio_queue.full():
+                try:
+                    self._audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
             await self._audio_queue.put(pcm_chunk)
 
     async def end_audio(self) -> None:
@@ -131,6 +139,18 @@ class GrpcSTTClient(STTClient):
             return self._results.get_nowait()
         except asyncio.QueueEmpty:
             return None
+
+    async def clear_buffer(self) -> None:
+        """Drain the audio queue to discard stale buffered chunks."""
+        dropped = 0
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped:
+            logger.info(f"[STT] clear_buffer: dropped {dropped} chunks from gRPC queue")
 
     async def stop_stream(self) -> None:
         self._streaming = False
@@ -217,7 +237,7 @@ class GrpcSTTClient(STTClient):
                     break
                 logger.warning(f"[STT] gRPC stream error: {exc}; retrying in {backoff:.2f}s")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 0.5)
+                backoff = min(backoff * 2, 1.5)
 
     def get_last_interim(self) -> str:
         """Return the most recent interim transcription (non-blocking)."""
@@ -326,7 +346,7 @@ class GrpcBatchSTTClient(STTClient):
                 elif "Unavailable model" not in err_str:
                     logger.warning(f"[STT] gRPC batch error: {exc}")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 0.5)
+                backoff = min(backoff * 2, 1.5)
 
     async def _recognize(self, audio: bytes) -> Optional[str]:
         asr_pb2, audio_pb2 = self._asr_pb2, self._audio_pb2
@@ -473,7 +493,7 @@ class VllmSTTClient(STTClient):
                     logger.warning(f"[STT] vLLM connection error: {type(exc).__name__}: {exc}")
                 elif _consecutive_conn_errors == 4:
                     logger.warning("[STT] vLLM unreachable; will keep retrying silently")
-                await asyncio.sleep(min(0.05 * (2 ** _consecutive_conn_errors), 0.5))
+                await asyncio.sleep(min(0.05 * (2 ** _consecutive_conn_errors), 1.5))
 
     async def _transcribe(self, pcm_data: bytes) -> Optional[str]:
         wav_buf = io.BytesIO()
@@ -554,6 +574,17 @@ class ParakeetWsSTTClient(STTClient):
         except asyncio.QueueEmpty:
             return None
 
+    async def clear_buffer(self) -> None:
+        """Send input_audio_buffer.clear to discard stale server-side audio."""
+        if self._ws and self._running:
+            try:
+                await self._ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                async with self._audio_lock:
+                    self._has_audio = False
+                logger.debug("[STT] Parakeet WS buffer cleared (drift reset)")
+            except Exception:
+                pass
+
     async def stop_stream(self) -> None:
         self._running = False
         if self._commit_task:
@@ -620,7 +651,7 @@ class ParakeetWsSTTClient(STTClient):
                 logger.warning(f"[STT] Parakeet WS error: {type(exc).__name__}: {exc}; "
                                f"reconnecting in {backoff:.2f}s")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 0.5)
+                backoff = min(backoff * 2, 1.5)
 
     async def _commit_loop(self):
         """Periodically commit the audio buffer to trigger transcription."""
@@ -718,6 +749,14 @@ class ElevenLabsSTTClient(STTClient):
             return self._results.get_nowait()
         except asyncio.QueueEmpty:
             return None
+
+    async def clear_buffer(self) -> None:
+        """Reset ElevenLabs-side audio buffer to discard stale audio."""
+        self._bytes_since_commit = 0
+        self._last_commit_ts = 0.0
+        async with self._audio_lock:
+            self._has_audio = False
+        logger.debug("[STT] ElevenLabs buffer cleared (drift reset)")
 
     async def stop_stream(self) -> None:
         self._running = False
@@ -916,6 +955,10 @@ class FailoverSTTClient(STTClient):
         except Exception as exc:
             await self._activate_fallback(exc)
             return await self._fallback.get_transcription()
+
+    async def clear_buffer(self) -> None:
+        active = self._primary if self._active == "primary" else self._fallback
+        await active.clear_buffer()
 
     async def stop_stream(self) -> None:
         errors = []

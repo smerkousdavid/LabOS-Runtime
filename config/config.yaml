@@ -11,7 +11,7 @@
 # Set this to the WebSocket URL of your NAT server.
 # ---------------------------------------------------------------------------
 nat_server:
-  url: "ws://100.102.174.60:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
+  url: "ws://100.76.229.46:8002/ws"           # e.g. ws://192.168.1.100:8002/ws
 
 # ---------------------------------------------------------------------------
 # XR Runtime -- streaming, video, gRPC
@@ -31,7 +31,7 @@ runtime:
 speech:
   stt:
     protocol: grpc                          # grpc | grpc-batch | http | vllm | parakeet_ws | elevenlabs_realtime
-    host: "100.102.174.60"
+    host: "100.76.229.46"
     port: 50051
     model: "parakeet-1.1b-en-US-asr-streaming"
     # language: "en"
@@ -80,7 +80,7 @@ speech:
       base_url: https://dashscope.aliyuncs.com/api/v1
       api_key_env: DASHSCOPE_API_KEY
     vibevoice:
-      host: "100.102.174.60"                   # TTS server hostname or IP
+      host: "100.76.229.46"                   # TTS server hostname or IP
       port: 8050
     elevenlabs:
       voice_id: "pNInz6obpgDQGcFmaJgB"       # Adam pre-made voice
@@ -169,7 +169,7 @@ robot:
 # Session management
 # ---------------------------------------------------------------------------
 session:
-  reset_on_disconnect: ask    # true | false | ask
+  reset_on_disconnect: true    # true | false | ask
 
 # ---------------------------------------------------------------------------
 # Global settings

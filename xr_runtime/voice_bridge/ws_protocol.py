@@ -102,14 +102,37 @@ class ToolCall(TypedDict):
     status: str  # "started" | "completed" | "failed"
 
 
+class SessionConnected(TypedDict):
+    type: Literal["session_connected"]
+    session_id: str
+    publish_rtsp: str
+
+
+class SessionCleared(TypedDict):
+    type: Literal["session_cleared"]
+
+
+class SessionConnectFailed(TypedDict):
+    type: Literal["session_connect_failed"]
+    reason: str
+
+
 # ---- Type unions for dispatch ------------------------------------------------
 
 InboundMessage = UserMessage | FrameResponse | AudioStream | VideoStream | StreamInfo | ProtocolPush | Ping
-OutboundMessage = AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly | WakeTimeout | Pong | ToolCall
+OutboundMessage = (
+    AgentResponse | Notification | DisplayUpdate | RequestFrames | TtsOnly
+    | WakeTimeout | Pong | ToolCall | SessionConnected | SessionCleared
+    | SessionConnectFailed
+)
 
 # All valid type strings
 INBOUND_TYPES = {"user_message", "frame_response", "audio_stream", "video_stream", "stream_info", "protocol_push", "ping"}
-OUTBOUND_TYPES = {"agent_response", "notification", "display_update", "request_frames", "tts_only", "wake_timeout", "pong", "tool_call"}
+OUTBOUND_TYPES = {
+    "agent_response", "notification", "display_update", "request_frames",
+    "tts_only", "wake_timeout", "pong", "tool_call",
+    "session_connected", "session_cleared", "session_connect_failed",
+}
 
 
 # ---- Helpers -----------------------------------------------------------------

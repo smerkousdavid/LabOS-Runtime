@@ -21,6 +21,7 @@ import base64
 import audioop
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -128,6 +129,16 @@ CHUNK_SIZE = int(SAMPLE_RATE * (AUDIO_CHUNK_MS / 1000.0) * BYTES_PER_SAMPLE)
 
 AUDIO_SILENCE_DISCONNECT_S = float(os.environ.get("AUDIO_SILENCE_DISCONNECT_S", "5"))
 AUDIO_READ_TIMEOUT_S = float(os.environ.get("AUDIO_READ_TIMEOUT_S", "5"))
+
+AUDIO_MAX_DRIFT_S = float(os.environ.get("AUDIO_MAX_DRIFT_S", "1.0"))
+AUDIO_BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE
+AUDIO_KEEP_AFTER_DRAIN_S = 0.15
+AUDIO_BURST_THRESHOLD_S = 0.01  # reads faster than this count as "burst"
+AUDIO_BURST_DRAIN_AFTER = 5  # drain after N consecutive burst reads
+
+HEARTBEAT_INTERVAL_S = float(os.environ.get("HEARTBEAT_INTERVAL_S", "10"))
+FRAME_HEARTBEAT_INTERVAL_S = 2.0
+FRAME_ABSENCE_DISCONNECT_S = float(os.environ.get("FRAME_ABSENCE_DISCONNECT_S", "4"))
 
 _xr_conn = None
 _xr_msg_conn = None  # dedicated connection for sending display messages
@@ -351,6 +362,7 @@ def _send_to_glasses_sync(message_type: str, payload: str) -> bool:
     """
     conn = _get_msg_connection()
     if conn is None:
+        logger.warning(f"[Bridge] No msg connection -- cannot send {message_type}")
         return False
     try:
         from xr_service_library.xr_types import Message
@@ -359,11 +371,11 @@ def _send_to_glasses_sync(message_type: str, payload: str) -> bool:
         if not result:
             logger.warning(f"[Bridge] send_message returned falsy for {message_type}")
             return False
+        logger.info(f"[Bridge] Sent {message_type} to glasses ({len(payload)} bytes)")
         return True
     except Exception as exc:
-        logger.warning(f"[Bridge] Send to glasses failed: {exc}")
-        if "context" in str(exc).lower():
-            _get_msg_connection(reconnect=True)
+        logger.warning(f"[Bridge] Send to glasses failed ({message_type}): {exc}")
+        _get_msg_connection(reconnect=True)
         return False
 
 
@@ -393,11 +405,20 @@ async def send_generic(text: str, source: str = "Agent"):
 def start_audio_decoder() -> subprocess.Popen:
     idx = f"{CAMERA_INDEX:04d}"
     rtsp_url = f"rtsp://{MEDIAMTX_HOST}:8554/NB_{idx}_TX_MIC_p6S"
+    max_delay_us = str(int(AUDIO_MAX_DRIFT_S * 1_000_000))
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-fflags", "nobuffer+discardcorrupt",
+        "-flags", "low_delay",
+        "-probesize", "32768",
+        "-analyzeduration", "0",
+        "-max_delay", max_delay_us,
+        "-rtbufsize", "128k",
         "-rtsp_transport", "tcp",
         "-i", rtsp_url,
+        "-af", "aresample=async=1",
         "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "1",
+        "-flush_packets", "1",
         "pipe:1",
     ]
     logger.info(f"[Bridge] Starting audio decoder: {' '.join(cmd)}")
@@ -446,6 +467,8 @@ async def handle_display_update(msg: dict):
         payload_str = str(payload_raw)
     msg_type = msg.get("message_type", "GENERIC")
     _last_display_update = (msg_type, payload_str)
+    if not _glasses_connected:
+        return
     await _send_to_glasses(msg_type, payload_str)
 
 
@@ -678,7 +701,12 @@ async def _recording_capture_task():
 # ---------------------------------------------------------------------------
 
 _qr_scanning_active = False
+_qr_scan_current_task: Optional[asyncio.Task] = None
+_qr_cooldown_until: float = 0.0  # monotonic timestamp; scanning blocked until this
+_QR_SESSION_COOLDOWN_S = float(os.environ.get("QR_SESSION_COOLDOWN_S", "15"))
 _rtsp_relay_proc = None
+_rtsp_relay_monitor_task: Optional[asyncio.Task] = None
+_glasses_connected = False
 _QR_SHOW_COMMANDS = {"show qr code", "show qr"}
 _QR_QUIT_COMMANDS = {"quit app"}
 
@@ -726,9 +754,20 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
     )
 
     logger.info("[QR] QR code scanning started")
+    _last_sent_qr: Optional[str] = None
+    _last_sent_qr_ts: float = 0.0
+    _QR_COOLDOWN_S = 5.0  # ignore same QR for N seconds after sending
 
     while _qr_scanning_active:
         try:
+            if not _glasses_connected:
+                await asyncio.sleep(interval)
+                continue
+
+            if time.monotonic() < _qr_cooldown_until:
+                await asyncio.sleep(interval)
+                continue
+
             conn = _get_xr_connection()
             frame = None
             if conn is not None:
@@ -743,24 +782,48 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
 
                 decoded_list = _decode_qr(frame)
                 for data in decoded_list:
+                    if (
+                        data == _last_sent_qr
+                        and (time.monotonic() - _last_sent_qr_ts) < _QR_COOLDOWN_S
+                    ):
+                        continue
+
                     logger.info(f"[QR] Decoded payload: {data[:200]}")
                     try:
                         payload = json.loads(data)
                     except (json.JSONDecodeError, TypeError):
-                        logger.info(f"[QR] Non-JSON QR detected (raw string), sending as-is")
-                        payload = {"t": "ll", "raw": data}
+                        payload = data
 
-                    if isinstance(payload, dict) and payload.get("t") == "ll":
-                        session_id = payload.get("session_id", "?")
-                        logger.info(f"[QR] Matched LabOS QR: session={session_id}")
+                    # Determine if this looks like a valid LabOS QR:
+                    #   - compact: dict with "h" and "s" keys
+                    #   - verbose: dict with "type"=="labos_live"
+                    #   - pairing code: short string (6-char or numeric)
+                    #   - any dict with "t"=="ll"
+                    is_valid = False
+                    if isinstance(payload, dict):
+                        is_valid = (
+                            payload.get("t") == "ll"
+                            or payload.get("type") == "labos_live"
+                            or ("h" in payload and "s" in payload)
+                        )
+                    elif isinstance(payload, str):
+                        is_valid = len(payload.strip()) >= 4
+
+                    if is_valid:
+                        global _qr_cooldown_until
+                        logger.info(f"[QR] Sending QR payload to NAT")
                         await ws_client.send({
                             "type": "qr_payload",
                             "payload": payload,
                         })
+                        _last_sent_qr = data
+                        _last_sent_qr_ts = time.monotonic()
+                        _qr_cooldown_until = time.monotonic() + _QR_SESSION_COOLDOWN_S
+                        logger.info(f"[QR] Cooldown set for {_QR_SESSION_COOLDOWN_S}s after sending payload")
                         _qr_scanning_active = False
                         break
                     else:
-                        logger.info(f"[QR] Ignoring QR -- type={payload.get('t', 'N/A')!r} (expected 'labos_live')")
+                        logger.info(f"[QR] Ignoring unrecognized QR data: {data[:80]}")
 
                 if not _qr_scanning_active:
                     break
@@ -791,8 +854,11 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
 
 
 def stop_qr_scanning():
-    global _qr_scanning_active
+    global _qr_scanning_active, _qr_scan_current_task
     _qr_scanning_active = False
+    if _qr_scan_current_task is not None and not _qr_scan_current_task.done():
+        _qr_scan_current_task.cancel()
+    _qr_scan_current_task = None
 
 
 def start_qr_scanning():
@@ -800,40 +866,142 @@ def start_qr_scanning():
     _qr_scanning_active = True
 
 
+def _launch_qr_scan(ws_client, *, force: bool = False) -> None:
+    """Start a QR scan task, cancelling any existing one first.
+
+    Respects the session cooldown unless *force* is True.
+    """
+    global _qr_scan_current_task
+    if not force and time.monotonic() < _qr_cooldown_until:
+        remaining = _qr_cooldown_until - time.monotonic()
+        logger.info(f"[QR] Launch blocked -- cooldown active ({remaining:.1f}s remaining)")
+        return
+    stop_qr_scanning()
+    start_qr_scanning()
+    _qr_scan_current_task = asyncio.create_task(_qr_scan_task(ws_client))
+
+
 # ---------------------------------------------------------------------------
 # RTSP relay to LabOS server
 # ---------------------------------------------------------------------------
 
-async def _start_rtsp_relay(local_rtsp_path: str, publish_rtsp: str):
-    """Start FFmpeg process to relay local RTSP stream to remote URL."""
-    global _rtsp_relay_proc
-    await _stop_rtsp_relay()
+_RTSP_RELAY_TIMEOUT_S = float(os.environ.get("RTSP_RELAY_TIMEOUT_S", "180"))
+_RTSP_RELAY_RETRY_DELAY = 2.0
+_rtsp_relay_ws_client: Optional[object] = None
 
-    local_url = f"rtsp://localhost:8554/{local_rtsp_path}"
+
+async def _drain_stderr(proc: asyncio.subprocess.Process, label: str):
+    """Read ffmpeg stderr line-by-line and log at WARNING level."""
+    assert proc.stderr is not None
+    while True:
+        line = await proc.stderr.readline()
+        if not line:
+            break
+        logger.warning(f"[RTSP] {label}: {line.decode(errors='replace').rstrip()}")
+
+
+async def _start_rtsp_relay(
+    local_rtsp_path: str, publish_rtsp: str, ws_client=None,
+):
+    """Start FFmpeg relay with time-based retry while the WS connection is alive."""
+    global _rtsp_relay_proc, _rtsp_relay_monitor_task, _rtsp_relay_ws_client
+    await _stop_rtsp_relay()
+    _rtsp_relay_ws_client = ws_client
+
+    local_url = f"rtsp://{MEDIAMTX_HOST}:8554/{local_rtsp_path}"
+    max_delay_us = str(int(AUDIO_MAX_DRIFT_S * 1_000_000))
     cmd = [
         "ffmpeg", "-y",
+        "-fflags", "nobuffer+genpts",
+        "-flags", "low_delay",
+        "-probesize", "5000000",
+        "-analyzeduration", "3000000",
+        "-max_delay", max_delay_us,
+        "-rtbufsize", "2M",
         "-rtsp_transport", "tcp",
         "-i", local_url,
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-avoid_negative_ts", "make_zero",
         "-f", "rtsp",
+        "-rtsp_transport", "tcp",
         publish_rtsp,
     ]
-    logger.info(f"[RTSP] Starting relay: {local_url} -> {publish_rtsp}")
-    try:
-        _rtsp_relay_proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+
+    async def _ws_alive() -> bool:
+        if _rtsp_relay_ws_client is None:
+            return True
+        return getattr(_rtsp_relay_ws_client, "connected", True)
+
+    async def _run_with_retry():
+        global _rtsp_relay_proc
+        start = time.monotonic()
+        attempt = 0
+        while (time.monotonic() - start) < _RTSP_RELAY_TIMEOUT_S:
+            if not await _ws_alive():
+                logger.info("[RTSP] WS disconnected -- stopping relay retries")
+                break
+            attempt += 1
+            elapsed = time.monotonic() - start
+            logger.info(
+                f"[RTSP] Starting relay (attempt {attempt}, "
+                f"{elapsed:.0f}s/{_RTSP_RELAY_TIMEOUT_S:.0f}s): "
+                f"{local_url} -> {publish_rtsp}"
+            )
+            try:
+                _rtsp_relay_proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except Exception as exc:
+                logger.error(f"[RTSP] Failed to spawn ffmpeg: {exc}")
+                _rtsp_relay_proc = None
+                await asyncio.sleep(_RTSP_RELAY_RETRY_DELAY)
+                continue
+
+            logger.info(f"[RTSP] Relay started (pid={_rtsp_relay_proc.pid})")
+            stderr_task = asyncio.create_task(_drain_stderr(_rtsp_relay_proc, "ffmpeg"))
+
+            exit_code = await _rtsp_relay_proc.wait()
+            await stderr_task
+
+            if exit_code == 0:
+                logger.info("[RTSP] Relay exited cleanly (exit_code=0)")
+                _rtsp_relay_proc = None
+                return
+
+            logger.warning(f"[RTSP] Relay exited (exit_code={exit_code})")
+            _rtsp_relay_proc = None
+
+            remaining = _RTSP_RELAY_TIMEOUT_S - (time.monotonic() - start)
+            if remaining > _RTSP_RELAY_RETRY_DELAY:
+                logger.info(
+                    f"[RTSP] Retrying in {_RTSP_RELAY_RETRY_DELAY}s "
+                    f"({remaining:.0f}s remaining)..."
+                )
+                await asyncio.sleep(_RTSP_RELAY_RETRY_DELAY)
+
+        elapsed = time.monotonic() - start
+        logger.error(
+            f"[RTSP] Relay gave up after {attempt} attempts / {elapsed:.0f}s"
         )
-        logger.info(f"[RTSP] Relay started (pid={_rtsp_relay_proc.pid})")
-    except Exception as exc:
-        logger.error(f"[RTSP] Failed to start relay: {exc}")
-        _rtsp_relay_proc = None
+
+    _rtsp_relay_monitor_task = asyncio.create_task(_run_with_retry())
 
 
 async def _stop_rtsp_relay():
-    """Stop the RTSP relay FFmpeg process."""
-    global _rtsp_relay_proc
+    """Stop the RTSP relay FFmpeg process and cancel the monitor task."""
+    global _rtsp_relay_proc, _rtsp_relay_monitor_task
+
+    if _rtsp_relay_monitor_task is not None:
+        _rtsp_relay_monitor_task.cancel()
+        try:
+            await _rtsp_relay_monitor_task
+        except asyncio.CancelledError:
+            pass
+        _rtsp_relay_monitor_task = None
+
     if _rtsp_relay_proc is not None:
         try:
             _rtsp_relay_proc.terminate()
@@ -858,7 +1026,7 @@ async def _handle_session_connected(msg: dict, ws_client):
     if publish_rtsp:
         idx = f"{CAMERA_INDEX:04d}"
         local_path = f"NB_{idx}_TX_CAM_RGB_MIC_p6S"
-        await _start_rtsp_relay(local_path, publish_rtsp)
+        await _start_rtsp_relay(local_path, publish_rtsp, ws_client=ws_client)
 
 
 async def _handle_session_cleared(ws_client):
@@ -867,21 +1035,30 @@ async def _handle_session_cleared(ws_client):
     await _stop_rtsp_relay()
 
     if INITIAL_QR_CODE:
-        import asyncio as _aio
-        start_qr_scanning()
-        _aio.create_task(_qr_scan_task(ws_client))
+        _launch_qr_scan(ws_client)
+
+
+async def _handle_session_connect_failed(msg: dict, ws_client):
+    """LabOS Live session failed to connect -- stop relay, return to QR scanning."""
+    reason = msg.get("reason", "unknown")
+    logger.warning(f"[Session] LabOS Live connect failed: {reason}")
+    await _stop_rtsp_relay()
+
+    if INITIAL_QR_CODE:
+        _launch_qr_scan(ws_client)
 
 
 async def _restart_qr_flow(ws_client: NATWebSocketClient, *, reset_ws: bool, reason: str) -> None:
     """Stop current live session state and return to QR scanning."""
+    global _last_display_update
     logger.info(f"[QR] Restart requested: {reason} reset_ws={reset_ws}")
     stop_qr_scanning()
     await _stop_rtsp_relay()
+    _last_display_update = None
     if reset_ws:
         await ws_client.reset_session()
     if INITIAL_QR_CODE:
-        start_qr_scanning()
-        asyncio.create_task(_qr_scan_task(ws_client))
+        _launch_qr_scan(ws_client)
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +1066,7 @@ async def _restart_qr_flow(ws_client: NATWebSocketClient, *, reset_ws: bool, rea
 # ---------------------------------------------------------------------------
 
 async def main():
-    global _status, _ww_filter, _recorder, _recording_task
+    global _status, _ww_filter, _recorder, _recording_task, _last_display_update
 
     logger.info(f"[Bridge] Starting for camera {CAMERA_INDEX}, session {SESSION_ID}")
 
@@ -958,13 +1135,17 @@ async def main():
         if _glasses_connected:
             asyncio.ensure_future(_status.update(server_connection="active"))
 
+    async def _on_ws_disconnect():
+        await _status.update(server_connection="inactive")
+        await _stop_rtsp_relay()
+
     ws_client = NATWebSocketClient(
         url=NAT_SERVER_URL,
         session_id=SESSION_ID,
         camera_index=CAMERA_INDEX,
         rtsp_base=f"rtsp://{RTSP_EXTERNAL_HOST}:8554",
         on_connect=_on_ws_connect,
-        on_disconnect=lambda: asyncio.ensure_future(_status.update(server_connection="inactive")),
+        on_disconnect=lambda: asyncio.ensure_future(_on_ws_disconnect()),
     )
 
     ws_client.on("agent_response", handle_agent_response)
@@ -976,11 +1157,12 @@ async def main():
     ws_client.on("wake_timeout", lambda msg: handle_wake_timeout(msg, ww_filter))
     ws_client.on("session_connected", lambda msg: _handle_session_connected(msg, ws_client))
     ws_client.on("session_cleared", lambda msg: _handle_session_cleared(ws_client))
+    ws_client.on("session_connect_failed", lambda msg: _handle_session_connect_failed(msg, ws_client))
 
     ws_task = asyncio.create_task(ws_client.run())
 
     if INITIAL_QR_CODE:
-        asyncio.create_task(_qr_scan_task(ws_client))
+        _launch_qr_scan(ws_client)
 
     frame_task = None
     if FORWARD_FRAMES:
@@ -998,31 +1180,163 @@ async def main():
 
     audio_seq = 0
     ffmpeg_proc = None
+    global _glasses_connected
     _retry_delay = 0.05
     prev_ww_state = "IDLE"
     _glasses_connected = False
     _disconnect_handled = False
-    _disconnect_timer: Optional[asyncio.Task] = None
+    _ever_connected = False  # True after first glasses connection
     _last_sent_utterance = ""
     _last_sent_utterance_ts = 0.0
     _last_good_chunk_ts = 0.0
 
-    async def _delayed_session_reset():
-        """Wait DISCONNECT_TIMEOUT_S then reset the session if still disconnected."""
-        try:
-            await asyncio.sleep(DISCONNECT_TIMEOUT_S)
+    # ------------------------------------------------------------------
+    # Heartbeat: periodically re-push status + cached display to glasses.
+    # Catches races where the initial push arrives before the UI is ready
+    # or the gRPC connection silently went stale.
+    # ------------------------------------------------------------------
+    async def _heartbeat_task():
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
             if not _glasses_connected:
-                logger.info(
-                    f"[Session] Glasses still disconnected after {DISCONNECT_TIMEOUT_S}s "
-                    "-- resetting session"
+                continue
+            _get_msg_connection(reconnect=True)
+            await _status.force_push()
+            if _last_display_update:
+                mt, pl = _last_display_update
+                await _send_to_glasses(mt, pl)
+
+    asyncio.create_task(_heartbeat_task())
+
+    # ------------------------------------------------------------------
+    # Frame-based disconnect detection: polls IPC frames and triggers a
+    # full disconnect / fresh-session cycle when the frame stream goes
+    # away (glasses app closed) and then resumes (glasses app reopened).
+    # ------------------------------------------------------------------
+    _last_frame_ts: float = 0.0
+    _frame_disconnect_done: bool = False
+
+    async def _do_glasses_disconnect(reason: str):
+        """Full disconnect: stop STT, clear state, reset WS session."""
+        global _last_display_update, _glasses_connected
+        nonlocal _frame_disconnect_done, _disconnect_handled
+        if _frame_disconnect_done:
+            return
+        _frame_disconnect_done = True
+        _glasses_connected = False
+        _disconnect_handled = True
+
+        logger.info(f"[Session] Glasses disconnected ({reason})")
+
+        await stt.stop_stream()
+        accumulator._buffer.clear()
+        ww_filter.reset()
+        _tts_cancel.set()
+
+        if _recording_task and not _recording_task.done():
+            _recording_task.cancel()
+        if _recorder and _recorder.running:
+            _recorder.stop()
+
+        await _stop_rtsp_relay()
+        stop_qr_scanning()
+
+        _last_display_update = None
+
+        await _status.update(
+            voice_assistant="idle",
+            server_connection="inactive",
+            robot_status="N/A",
+        )
+
+        logger.info("[Session] Resetting WS session for clean reconnect")
+        await ws_client.reset_session()
+
+    async def _do_glasses_reconnect():
+        """Full reconnect: fresh IPC + WS is auto-reconnected + QR flow."""
+        global _glasses_connected
+        nonlocal _frame_disconnect_done, _disconnect_handled
+        _frame_disconnect_done = False
+        _glasses_connected = True
+        _disconnect_handled = False
+
+        _get_xr_connection(reconnect=True)
+        _get_msg_connection(reconnect=True)
+
+        logger.info("[Session] Glasses reconnected -- starting fresh session")
+
+        await stt.start_stream()
+
+        _status.voice_assistant = "idle"
+        _status.server_connection = "active" if ws_client.connected else "inactive"
+        await _status.force_push()
+
+        # Re-push status after UI has time to initialize
+        async def _deferred_reconnect_push():
+            await asyncio.sleep(3)
+            if _glasses_connected:
+                logger.info("[Session] Deferred reconnect push (3s)")
+                _get_msg_connection(reconnect=True)
+                await _status.force_push()
+        asyncio.create_task(_deferred_reconnect_push())
+
+        if INITIAL_QR_CODE:
+            _launch_qr_scan(ws_client)
+            logger.info("[Session] QR scanning restarted for fresh session")
+
+    async def _frame_heartbeat_task():
+        nonlocal _last_frame_ts, _frame_disconnect_done
+        _frame_was_absent = False
+        while True:
+            await asyncio.sleep(FRAME_HEARTBEAT_INTERVAL_S)
+            conn = _get_xr_connection()
+            if conn is None:
+                continue
+            try:
+                raw = await asyncio.get_event_loop().run_in_executor(
+                    None, conn.get_latest_frame,
                 )
-                await ws_client.reset_session()
-        except asyncio.CancelledError:
-            logger.info("[Session] Disconnect timer cancelled (glasses reconnected)")
+                frame = _extract_numpy_frame(raw)
+            except Exception:
+                frame = None
+
+            now = time.monotonic()
+            if frame is not None:
+                if _frame_was_absent:
+                    logger.info("[Heartbeat] Frames resumed after absence")
+                    await _do_glasses_reconnect()
+                _frame_was_absent = False
+                _last_frame_ts = now
+            else:
+                if (
+                    _last_frame_ts > 0
+                    and (now - _last_frame_ts) >= FRAME_ABSENCE_DISCONNECT_S
+                    and not _frame_was_absent
+                ):
+                    _frame_was_absent = True
+                    logger.info(
+                        f"[Heartbeat] No frames for "
+                        f"{now - _last_frame_ts:.1f}s -- glasses disconnected"
+                    )
+                    await _do_glasses_disconnect(
+                        f"no frames for {now - _last_frame_ts:.1f}s"
+                    )
+
+    asyncio.create_task(_frame_heartbeat_task())
+
+    _drift_wall_start: float = 0.0
+    _drift_bytes_read: int = 0
+    _burst_count: int = 0
+    _last_read_start: float = 0.0
+    _drift_log_interval: float = 30.0
+    _last_drift_log: float = 0.0
 
     try:
         while True:
             if ffmpeg_proc is None or ffmpeg_proc.poll() is not None:
+                _drift_wall_start = 0.0
+                _drift_bytes_read = 0
+                _burst_count = 0
                 if ffmpeg_proc is not None:
                     ffmpeg_proc.stdout.close()
                     ffmpeg_proc.stderr.close()
@@ -1033,44 +1347,18 @@ async def main():
                     and _last_good_chunk_ts > 0
                     and (time.monotonic() - _last_good_chunk_ts) >= AUDIO_SILENCE_DISCONNECT_S
                 ):
-                    _glasses_connected = False
-                    _disconnect_handled = True
                     silence_s = time.monotonic() - _last_good_chunk_ts
-                    logger.info(
-                        f"[Session] Glasses disconnected -- no audio for "
-                        f"{silence_s:.1f}s"
+                    await _do_glasses_disconnect(
+                        f"no audio for {silence_s:.1f}s"
                     )
-                    if _recorder and _recorder.running:
+                    if _recorder:
                         _recorder.log_data(f"Glasses disconnected (no audio for {silence_s:.1f}s)")
 
-                    if _recording_task and not _recording_task.done():
-                        _recording_task.cancel()
-                    if _recorder and _recorder.running:
-                        _recorder.stop()
-
-                    await stt.stop_stream()
-                    accumulator._buffer.clear()
-                    ww_filter.reset()
-                    _tts_cancel.set()
-
-                    if RESET_SESSION == "true":
-                        if _disconnect_timer and not _disconnect_timer.done():
-                            _disconnect_timer.cancel()
-                        _disconnect_timer = asyncio.create_task(_delayed_session_reset())
-                        logger.info(
-                            f"[Session] Disconnect timer started ({DISCONNECT_TIMEOUT_S}s)"
-                        )
-
-                    await _status.update(
-                        voice_assistant="idle",
-                        server_connection="inactive",
-                        robot_status="N/A",
-                    )
-
                 await asyncio.sleep(_retry_delay)
-                _retry_delay = min(_retry_delay * 2, 0.5)
+                _retry_delay = min(_retry_delay * 2, 1.5)
                 ffmpeg_proc = start_audio_decoder()
 
+            _last_read_start = time.monotonic()
             try:
                 chunk = await asyncio.wait_for(
                     asyncio.get_event_loop().run_in_executor(
@@ -1082,37 +1370,153 @@ async def main():
                 logger.warning("[Bridge] Audio decoder stalled -- restarting")
                 if _recorder and _recorder.running:
                     _recorder.log_error("Audio decoder stalled -- restarting FFmpeg")
-                ffmpeg_proc.kill()
-                ffmpeg_proc.stdout.close()
-                ffmpeg_proc.stderr.close()
+                try:
+                    ffmpeg_proc.kill()
+                    ffmpeg_proc.wait(timeout=2)
+                except Exception:
+                    pass
+                try:
+                    ffmpeg_proc.stdout.close()
+                    ffmpeg_proc.stderr.close()
+                except Exception:
+                    pass
                 ffmpeg_proc = None
                 continue
 
             if not chunk:
+                try:
+                    ffmpeg_proc.wait(timeout=2)
+                except Exception:
+                    pass
                 ffmpeg_proc = None
                 continue
 
+            read_elapsed = time.monotonic() - _last_read_start
             _last_good_chunk_ts = time.monotonic()
             _retry_delay = 0.05
 
+            # Burst detection: if the read returned almost instantly,
+            # ffmpeg had buffered data (pipeline latency accumulation).
+            if read_elapsed < AUDIO_BURST_THRESHOLD_S:
+                _burst_count += 1
+            else:
+                _burst_count = 0
+
+            if _burst_count >= AUDIO_BURST_DRAIN_AFTER:
+                fd = ffmpeg_proc.stdout.fileno()
+                drained = 0
+                while True:
+                    ready, _, _ = select.select([fd], [], [], 0)
+                    if not ready:
+                        break
+                    discarded = os.read(fd, 65536)
+                    if not discarded:
+                        break
+                    drained += len(discarded)
+                if drained > 0:
+                    await stt.clear_buffer()
+                    logger.warning(
+                        f"[Bridge] Burst drain: {_burst_count} fast reads, "
+                        f"discarded {drained}B ({drained/AUDIO_BYTES_PER_SEC:.2f}s)"
+                    )
+                _burst_count = 0
+                _drift_wall_start = time.monotonic()
+                _drift_bytes_read = 0
+                continue
+
+            # --- Drift detection: skip stale audio when pipeline falls behind ---
+            now_mono = _last_good_chunk_ts
+            if _drift_wall_start == 0.0:
+                _drift_wall_start = now_mono
+                _drift_bytes_read = 0
+            _drift_bytes_read += len(chunk)
+            audio_duration = _drift_bytes_read / AUDIO_BYTES_PER_SEC
+            wall_elapsed = now_mono - _drift_wall_start
+            drift = audio_duration - wall_elapsed
+            if drift > AUDIO_MAX_DRIFT_S:
+                # Smart partial drain: discard exactly enough bytes to land
+                # back at real-time, but keep the most recent audio so the
+                # STT stream stays continuous.
+                keep_bytes = int(AUDIO_KEEP_AFTER_DRAIN_S * AUDIO_BYTES_PER_SEC)
+                target_drain = int(drift * AUDIO_BYTES_PER_SEC) - keep_bytes
+                drained = 0
+                fd = ffmpeg_proc.stdout.fileno()
+                while drained < target_drain:
+                    ready, _, _ = select.select([fd], [], [], 0)
+                    if not ready:
+                        break
+                    to_read = min(65536, target_drain - drained)
+                    discarded = os.read(fd, to_read)
+                    if not discarded:
+                        break
+                    drained += len(discarded)
+                await stt.clear_buffer()
+                _drift_wall_start = time.monotonic()
+                _drift_bytes_read = keep_bytes
+                logger.warning(
+                    f"[Bridge] Audio drift {drift:.2f}s > {AUDIO_MAX_DRIFT_S}s "
+                    f"-- drained {drained}B ({drained/AUDIO_BYTES_PER_SEC:.2f}s), "
+                    f"kept ~{AUDIO_KEEP_AFTER_DRAIN_S}s tail"
+                )
+                continue
+
+            now_for_log = time.monotonic()
+            if now_for_log - _last_drift_log >= _drift_log_interval:
+                _inner = stt
+                if hasattr(_inner, '_primary'):
+                    _inner = getattr(_inner, '_primary', _inner)
+                stt_qsize = getattr(_inner, '_audio_queue', None)
+                qd = stt_qsize.qsize() if stt_qsize is not None else "?"
+                logger.info(
+                    f"[Bridge] Audio stats: drift={drift:.2f}s "
+                    f"read_ms={read_elapsed*1000:.0f} "
+                    f"stt_queue={qd} burst={_burst_count}"
+                )
+                _last_drift_log = now_for_log
+
             if not _glasses_connected:
+                # If the frame heartbeat already handled this reconnect,
+                # _frame_disconnect_done will be False (cleared by _do_glasses_reconnect).
+                # Otherwise, this is the first detection — do a full fresh start.
+                if _frame_disconnect_done:
+                    # Frame heartbeat already triggered disconnect but hasn't
+                    # seen frames resume yet.  Let the frame heartbeat handle
+                    # the reconnect to avoid a race.
+                    continue
+
                 _glasses_connected = True
                 _disconnect_handled = False
-                if _disconnect_timer and not _disconnect_timer.done():
-                    _disconnect_timer.cancel()
-                    _disconnect_timer = None
-                    logger.info("[Session] Disconnect timer cancelled -- glasses reconnected")
-                logger.info("[Bridge] Audio stream active -- restarting STT")
+                _frame_disconnect_done = False
+
+                _get_xr_connection(reconnect=True)
+                _get_msg_connection(reconnect=True)
+
+                if _ever_connected:
+                    _last_display_update = None
+                    logger.info("[Bridge] Glasses reconnected -- resetting WS for fresh session")
+                    await ws_client.reset_session()
+                else:
+                    logger.info("[Bridge] First glasses connection -- audio stream active")
+                _ever_connected = True
+
                 await stt.start_stream()
+                _last_frame_ts = time.monotonic()
 
                 _status.voice_assistant = "idle"
-                _status.server_connection = "active"
+                _status.server_connection = "active" if ws_client.connected else "inactive"
                 await _status.force_push()
 
-                if _last_display_update:
-                    mt, pl = _last_display_update
-                    logger.info(f"[Bridge] Replaying cached display_update ({mt})")
-                    await _send_to_glasses(mt, pl)
+                async def _deferred_initial_push():
+                    await asyncio.sleep(3)
+                    if _glasses_connected:
+                        logger.info("[Bridge] Deferred initial push (3s)")
+                        _get_msg_connection(reconnect=True)
+                        await _status.force_push()
+                asyncio.create_task(_deferred_initial_push())
+
+                if INITIAL_QR_CODE:
+                    _launch_qr_scan(ws_client)
+                    logger.info("[Session] QR scanning started")
 
                 if _recorder and not _recorder.running:
                     _recorder.start()

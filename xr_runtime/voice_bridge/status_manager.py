@@ -62,9 +62,9 @@ class StatusManager:
         try:
             result = await self._send_fn("COMPONENTS_STATUS", json.dumps(payload))
             if result:
-                logger.debug(f"[Status] Pushed: {payload}")
+                logger.info(f"[Status] Pushed: {payload}")
                 return True
-            logger.debug(f"[Status] Push deferred (connection not ready): {payload}")
+            logger.warning(f"[Status] Push deferred (connection not ready): {payload}")
             return False
         except Exception as exc:
             logger.warning(f"[Status] Failed to push status: {exc}")
