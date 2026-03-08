@@ -21,6 +21,7 @@ import base64
 import audioop
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -69,7 +70,14 @@ _SUPPRESSED_TOOLS: set = _load_tool_filter()
 
 NAT_SERVER_URL = os.environ.get("NAT_SERVER_URL", "ws://localhost:8002/ws")
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1"))
-SESSION_ID = os.environ.get("SESSION_ID", f"demo-{CAMERA_INDEX}")
+
+
+def _default_session_id() -> str:
+    """Unique per-runtime session id: labos-runtime-<random_hex>-<camera_index>."""
+    return f"labos-runtime-{secrets.token_hex(4)}-{CAMERA_INDEX}"
+
+
+SESSION_ID = os.environ.get("SESSION_ID", _default_session_id())
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 STT_HOST = os.environ.get("STT_HOST", "localhost")
 STT_PORT = int(os.environ.get("STT_PORT", "50051"))

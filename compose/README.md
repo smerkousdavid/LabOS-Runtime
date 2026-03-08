@@ -127,12 +127,12 @@ services:
 
   voice-bridge-1:
     environment:
-      - SESSION_ID=demo-1
+      - SESSION_ID=labos-runtime-<random>-1
       - CAMERA_INDEX=1
     # ...
   voice-bridge-2:
     environment:
-      - SESSION_ID=demo-2
+      - SESSION_ID=labos-runtime-<random>-2
       - CAMERA_INDEX=2
     # ...
 

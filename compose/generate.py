@@ -5,6 +5,7 @@ Usage: python generate.py <num_cameras> <streaming_method> <default_framerate> [
 """
 
 import os
+import secrets
 import sys
 
 import jinja2
@@ -24,6 +25,9 @@ def main():
         print("Error: streaming_method must be 'gstreamer' or 'mediamtx'")
         sys.exit(1)
 
+    # Unique session suffix for this runtime (stable per compose generation)
+    runtime_session_suffix = secrets.token_hex(4)
+
     base_ports = {
         "GRPC_PORT": 5050,
         "WEB_PORT": 5001,
@@ -42,6 +46,7 @@ def main():
         "num_cameras": num_cameras,
         "streaming_method": streaming_method,
         "default_framerate": default_framerate,
+        "runtime_session_suffix": runtime_session_suffix,
         "base_ports": base_ports,
         "mediamtx_service_name": os.environ.get("MEDIAMTX_SERVICE_NAME", "mediamtx"),
         "rtsp_image": os.environ.get("RTSP_IMAGE", "labos_streaming:latest"),
