@@ -40,6 +40,8 @@ class NATWebSocketClient:
         self._max_reconnect_delay = 30.0
         self._on_connect = on_connect
         self._on_disconnect = on_disconnect
+        self._last_protocol_signature: Optional[str] = None
+        self._protocol_sync_lock = asyncio.Lock()
 
     @property
     def connected(self) -> bool:
@@ -48,25 +50,29 @@ class NATWebSocketClient:
     def on(self, message_type: str, callback: MessageCallback):
         self._callbacks[message_type] = callback
 
-    async def send(self, message: dict):
+    async def send(self, message: dict) -> bool:
         if self._ws is None:
-            return
+            return False
         try:
             await self._ws.send(json.dumps(message))
+            return True
         except Exception as exc:
             logger.warning(f"[WS Client] Send failed: {exc}")
+            return False
 
     async def run(self):
         import websockets
 
         self._running = True
         while self._running:
+            protocol_sync_task: Optional[asyncio.Task] = None
             try:
                 logger.info(f"[WS Client] Connecting to {self._url}")
                 async with websockets.connect(self._url) as ws:
                     self._ws = ws
                     self._reconnect_delay = 1.0
                     logger.info(f"[WS Client] Connected (session={self._session_id})")
+                    protocol_sync_task = asyncio.create_task(self._protocol_sync_loop())
 
                     if self._on_connect:
                         self._on_connect()
@@ -88,6 +94,14 @@ class NATWebSocketClient:
                     f"Reconnecting in {self._reconnect_delay:.0f}s"
                 )
             finally:
+                if protocol_sync_task is not None:
+                    try:
+                        protocol_sync_task.cancel()
+                        await protocol_sync_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
                 was_connected = self._ws is not None
                 self._ws = None
                 if was_connected and self._on_disconnect:
@@ -113,7 +127,7 @@ class NATWebSocketClient:
 
     async def _send_stream_info(self):
         idx = f"{self._camera_index:04d}"
-        await self.send({
+        sent = await self.send({
             "type": "stream_info",
             "camera_index": self._camera_index,
             "rtsp_base": self._rtsp_base,
@@ -123,15 +137,17 @@ class NATWebSocketClient:
                 "merged": f"NB_{idx}_TX_CAM_RGB_MIC_p6S",
             },
         })
-        await self._send_local_protocols()
+        if not sent:
+            logger.warning("[WS Client] Failed to send stream_info; will retry on next reconnect")
+        await self._send_local_protocols(force=True)
 
-    async def _send_local_protocols(self):
-        """Scan local protocols/ directory and push contents to NAT."""
+    def _collect_local_protocols(self) -> list[dict[str, str]]:
+        """Scan local protocols/ directory and return payload-ready protocol data."""
         from pathlib import Path
 
         proto_dir = Path("protocols")
         if not proto_dir.is_dir():
-            return
+            return []
 
         exts = {".txt", ".md", ".csv", ".json", ".yaml", ".yml"}
         protocols = []
@@ -143,10 +159,36 @@ class NATWebSocketClient:
                         protocols.append({"name": f.name, "content": content})
                 except Exception as exc:
                     logger.warning(f"[WS Client] Failed to read protocol {f.name}: {exc}")
+        return protocols
 
-        if protocols:
-            await self.send({"type": "protocol_push", "protocols": protocols})
-            logger.info(f"[WS Client] Pushed {len(protocols)} protocol(s) to NAT")
+    async def _send_local_protocols(self, force: bool = False):
+        """Push protocols to NAT (all filenames preserved exactly)."""
+        async with self._protocol_sync_lock:
+            protocols = self._collect_local_protocols()
+            signature = json.dumps(protocols, sort_keys=True, ensure_ascii=False)
+            if not force and signature == self._last_protocol_signature:
+                return True
+
+            sent = await self.send({"type": "protocol_push", "protocols": protocols})
+            if not sent:
+                logger.warning("[WS Client] Protocol push failed; keeping pending state for retry")
+                return False
+
+            self._last_protocol_signature = signature
+            names = ", ".join(p["name"] for p in protocols) if protocols else "(none)"
+            logger.info(f"[WS Client] Pushed {len(protocols)} protocol(s) to NAT: {names}")
+            return True
+
+    async def _protocol_sync_loop(self):
+        """Periodically sync local protocol files to NAT while connected."""
+        while self._ws is not None:
+            try:
+                sent = await self._send_local_protocols(force=False)
+            except Exception as exc:
+                logger.warning(f"[WS Client] Protocol sync failed: {exc}")
+                sent = False
+            # Retry faster when a push did not go through.
+            await asyncio.sleep(5.0 if sent else 2.0)
 
     async def _dispatch(self, msg: dict):
         msg_type = msg.get("type", "")

@@ -356,8 +356,17 @@ def _send_to_glasses_sync(message_type: str, payload: str) -> bool:
         from xr_service_library.xr_types import Message
         msg = Message(message_type=message_type, payload=payload)
         result = conn.send_message(msg)
-        if not result:
-            logger.warning(f"[Bridge] send_message returned falsy for {message_type}")
+        if result:
+            return True
+
+        logger.warning(f"[Bridge] send_message returned falsy for {message_type}; reconnecting once")
+        retry_conn = _get_msg_connection(reconnect=True)
+        if retry_conn is None:
+            return False
+
+        retry_result = retry_conn.send_message(msg)
+        if not retry_result:
+            logger.warning(f"[Bridge] send_message retry returned falsy for {message_type}")
             return False
         return True
     except Exception as exc:
@@ -716,6 +725,9 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
     _qr_scanning_active = True
     import cv2
     interval = 0.25
+    panel_resend_interval = 2.0
+    last_panel_payload: Optional[str] = None
+    last_panel_send_ts = 0.0
     _prompt_msg = (
         "<size=16><color=#59D2FF>Point at the QR code on screen</color></size>"
         '<size=14><color=#CCCCCC>\nSay "show qr code" or "quit app" to restart session</color></size>'
@@ -778,7 +790,17 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
                 ]
 
             panel_payload = json.dumps({"messages": messages})
-            await _send_to_glasses("SINGLE_STEP_PANEL_CONTENT", panel_payload)
+            now = time.monotonic()
+            # Avoid flooding gRPC queue with identical panel payloads while in QR loop.
+            should_send_panel = (
+                panel_payload != last_panel_payload
+                or (now - last_panel_send_ts) >= panel_resend_interval
+            )
+            if should_send_panel:
+                sent = await _send_to_glasses("SINGLE_STEP_PANEL_CONTENT", panel_payload)
+                if sent:
+                    last_panel_payload = panel_payload
+                    last_panel_send_ts = now
 
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
