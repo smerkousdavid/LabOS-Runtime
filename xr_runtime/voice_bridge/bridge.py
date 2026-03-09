@@ -1047,6 +1047,7 @@ async def main():
     _disconnect_handled = False
     _disconnect_timer: Optional[asyncio.Task] = None
     _recorder_disconnect_timer: Optional[asyncio.Task] = None
+    _last_recorder_start_attempt = 0.0
     _last_sent_utterance = ""
     _last_sent_utterance_ts = 0.0
     _last_good_chunk_ts = 0.0
@@ -1184,12 +1185,27 @@ async def main():
                 if _recorder and not _recorder.running:
                     if _has_live_xr_frame():
                         _recorder.start()
+                        _last_recorder_start_attempt = time.monotonic()
                     else:
                         logger.info("[Recorder] Skipping recorder start: no active XR frame yet")
                     if _recording_task is None or _recording_task.done():
                         _recording_task = asyncio.create_task(_recording_capture_task())
                 if _recorder and _recorder.running:
                     _recorder.log_data("Glasses connected -- audio stream active")
+
+            # If the first reconnect edge had no frame yet, keep retrying recorder
+            # start while connected so recording begins as soon as XR frames arrive.
+            if _glasses_connected and _recorder and not _recorder.running:
+                now = time.monotonic()
+                if now - _last_recorder_start_attempt >= 1.0:
+                    _last_recorder_start_attempt = now
+                    if _has_live_xr_frame():
+                        logger.info("[Recorder] XR frame detected -- starting recorder")
+                        _recorder.start()
+                        if _recording_task is None or _recording_task.done():
+                            _recording_task = asyncio.create_task(_recording_capture_task())
+                        if _recorder.running:
+                            _recorder.log_data("Glasses connected -- recording started after frame detection")
 
             if STT_NOISE_CORRECTION_ENABLED:
                 try:
