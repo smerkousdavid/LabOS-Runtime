@@ -136,6 +136,7 @@ CHUNK_SIZE = int(SAMPLE_RATE * (AUDIO_CHUNK_MS / 1000.0) * BYTES_PER_SAMPLE)
 
 AUDIO_SILENCE_DISCONNECT_S = float(os.environ.get("AUDIO_SILENCE_DISCONNECT_S", "5"))
 AUDIO_READ_TIMEOUT_S = float(os.environ.get("AUDIO_READ_TIMEOUT_S", "5"))
+RECORDER_DISCONNECT_GRACE_S = float(os.environ.get("RECORDER_DISCONNECT_GRACE_S", "800"))
 
 _xr_conn = None
 _xr_msg_conn = None  # dedicated connection for sending display messages
@@ -690,6 +691,18 @@ async def _recording_capture_task():
             await asyncio.sleep(1.0)
 
 
+def _has_live_xr_frame() -> bool:
+    """Best-effort check that this camera currently has a valid XR frame."""
+    try:
+        conn = _get_xr_connection()
+        if conn is None:
+            return False
+        raw = conn.get_latest_frame()
+        return _extract_numpy_frame(raw) is not None
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # QR Code scanning
 # ---------------------------------------------------------------------------
@@ -1033,6 +1046,7 @@ async def main():
     _glasses_connected = False
     _disconnect_handled = False
     _disconnect_timer: Optional[asyncio.Task] = None
+    _recorder_disconnect_timer: Optional[asyncio.Task] = None
     _last_sent_utterance = ""
     _last_sent_utterance_ts = 0.0
     _last_good_chunk_ts = 0.0
@@ -1049,6 +1063,22 @@ async def main():
                 await ws_client.reset_session()
         except asyncio.CancelledError:
             logger.info("[Session] Disconnect timer cancelled (glasses reconnected)")
+
+    async def _delayed_recorder_stop():
+        """Keep recording session open across short disconnects."""
+        try:
+            await asyncio.sleep(RECORDER_DISCONNECT_GRACE_S)
+            if not _glasses_connected and _recorder and _recorder.running:
+                logger.info(
+                    f"[Recorder] No reconnect after {RECORDER_DISCONNECT_GRACE_S:.0f}s -- "
+                    "stopping recorder session"
+                )
+                _recorder.log_data(
+                    f"No reconnect for {RECORDER_DISCONNECT_GRACE_S:.0f}s -- stopping recorder"
+                )
+                _recorder.stop()
+        except asyncio.CancelledError:
+            logger.info("[Recorder] Disconnect grace timer cancelled -- resumed same recording")
 
     try:
         while True:
@@ -1073,10 +1103,14 @@ async def main():
                     if _recorder and _recorder.running:
                         _recorder.log_data(f"Glasses disconnected (no audio for {silence_s:.1f}s)")
 
-                    if _recording_task and not _recording_task.done():
-                        _recording_task.cancel()
                     if _recorder and _recorder.running:
-                        _recorder.stop()
+                        _recorder.log_data(
+                            f"Holding recorder open for {RECORDER_DISCONNECT_GRACE_S:.0f}s "
+                            "waiting for reconnect"
+                        )
+                        if _recorder_disconnect_timer and not _recorder_disconnect_timer.done():
+                            _recorder_disconnect_timer.cancel()
+                        _recorder_disconnect_timer = asyncio.create_task(_delayed_recorder_stop())
 
                     await stt.stop_stream()
                     accumulator._buffer.clear()
@@ -1132,6 +1166,9 @@ async def main():
                     _disconnect_timer.cancel()
                     _disconnect_timer = None
                     logger.info("[Session] Disconnect timer cancelled -- glasses reconnected")
+                if _recorder_disconnect_timer and not _recorder_disconnect_timer.done():
+                    _recorder_disconnect_timer.cancel()
+                    _recorder_disconnect_timer = None
                 logger.info("[Bridge] Audio stream active -- restarting STT")
                 await stt.start_stream()
 
@@ -1145,7 +1182,10 @@ async def main():
                     await _send_to_glasses(mt, pl)
 
                 if _recorder and not _recorder.running:
-                    _recorder.start()
+                    if _has_live_xr_frame():
+                        _recorder.start()
+                    else:
+                        logger.info("[Recorder] Skipping recorder start: no active XR frame yet")
                     if _recording_task is None or _recording_task.done():
                         _recording_task = asyncio.create_task(_recording_capture_task())
                 if _recorder and _recorder.running:
@@ -1339,6 +1379,8 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        if _recorder_disconnect_timer and not _recorder_disconnect_timer.done():
+            _recorder_disconnect_timer.cancel()
         if _recording_task and not _recording_task.done():
             _recording_task.cancel()
         if _recorder and _recorder.running:
