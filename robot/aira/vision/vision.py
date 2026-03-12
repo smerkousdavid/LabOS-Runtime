@@ -70,12 +70,10 @@ def object_within(
 
 
 def camera_to_tool(p_cam_mm: np.ndarray, T_cam_to_tool: np.ndarray) -> np.ndarray:
-    if p_cam_mm.size == 3:
-        p = np.append(np.asarray(p_cam_mm, dtype=np.float64), 1.0)
-    else:
-        p = np.asarray(p_cam_mm, dtype=np.float64).ravel()[:4]
-    p_tool = T_cam_to_tool @ p
-    return p_tool[:3]
+    """Transform point from camera frame to tool (EE) frame.
+    Thin wrapper around coords.camera_to_ee (without tare; tare is applied by callers)."""
+    from aira.coords import camera_to_ee
+    return camera_to_ee(p_cam_mm, T_cam_to_tool, tare=(0.0, 0.0, 0.0))
 
 
 def load_classes_from_yaml(yaml_path: Path) -> Optional[List[str]]:

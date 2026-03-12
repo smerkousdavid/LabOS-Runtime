@@ -5,8 +5,12 @@ YAML protocol runner: run robot procedures from YAML with queryable status.
 - join_protocol(timeout): wait for protocol to finish.
 - get_protocol_status(): return current step, progress %, state (for MCP).
 
-Step types: load_home, home, go_to, move (tool_move), move_joint (relative joint angles), move_to_object, z_level, z_level_object,
-  grip, sleep, run (subprotocol), stop.
+Step types: load_home, home, go_to, move, move_joint, move_to_object, z_level,
+  z_level_object, grip, sleep, run (subprotocol), stop, move_world, move_other.
+
+Steps support an optional ``arm`` field to target a specific arm (e.g. arm: left).
+``go_to`` auto-detects from the location file's ``arm`` metadata.
+``move_to_object`` also accepts ``camera_arm`` for cross-arm vision.
 
 Protocols can define top-level "args" with defaults. Steps can use "{{arg_name}}".
 The "run" step runs another YAML file (relative to protocols/ or current file) with optional args.
@@ -16,6 +20,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from aira.utils.paths import get_project_root
 
@@ -89,16 +95,24 @@ def _update_status(**kwargs: Any) -> None:
     _status_changed_event.set()
 
 
+def _resolve_arm_name(step: Dict[str, Any]) -> Optional[str]:
+    """Extract the ``arm`` field from a step dict. None means default arm."""
+    val = step.get("arm")
+    if val is not None:
+        return str(val).strip() or None
+    return None
+
+
 def _run_failure_steps(failure_steps: List[Dict[str, Any]]) -> None:
     """Execute failure block steps (same handlers as protocol steps)."""
     from aira.robot import arm
-    a = arm()
-    objects = _load_objects()
     for s in failure_steps:
         step_type = (s.get("step") or "").strip().lower()
         if step_type == "stop":
             continue
+        arm_name = _resolve_arm_name(s)
         try:
+            a = arm(name=arm_name)
             if step_type == "grip":
                 pos = s.get("state", 800)
                 a.set_gripper_position(float(pos), wait=True)
@@ -146,29 +160,72 @@ def _execute_step(
     args: Optional[Dict[str, Any]] = None,
     protocol_path: Optional[Path] = None,
 ) -> None:
-    """Execute a single protocol step. Raises on error. If args given, {{key}} in step values are substituted."""
+    """Execute a single protocol step. Raises on error.
+
+    Steps may include ``arm: left|right`` to target a specific arm and
+    ``camera_arm: ...`` for cross-arm vision in move_to_object.
+
+    For ``go_to``, if the location file has ``"arm": "both"`` the step
+    moves both arms in parallel (or sequentially with ``parallel: false``).
+    """
     import yaml
-    from aira.robot import arm, move_to_object
+    from aira.robot import arm, move_to_object, load_location, execute_parallel
+
     step = _substitute_args(dict(step), args) if args else step
-    a = arm()
+    arm_name = _resolve_arm_name(step)
+    a = arm(name=arm_name)
     step_type = (step.get("step") or "").strip().lower()
+
+    # ------------------------------------------------------------------
     if step_type == "load_home":
         f = step.get("file", "home.json")
         path = Path(f)
         if not path.is_absolute():
             path = BASE / path
         a.load_ref_frame(path)
+
     elif step_type == "home":
         a.home()
+
+    # ------------------------------------------------------------------
     elif step_type == "go_to":
         location = (step.get("location") or step.get("go_to") or "").strip()
         if not location:
             raise ValueError("go_to step requires 'location' or 'go_to'")
-        code = a.go_to(location, speed=float(step.get("speed", 100)), acc=float(step.get("acc", 500)), wait=True)
-        if code != 0:
-            if a.check_error():
-                a.clear_error()
-            raise RuntimeError(f"go_to returned code {code}")
+        speed = float(step.get("speed", 100))
+        acc = float(step.get("acc", 500))
+
+        loc_data = load_location(location)
+        loc_arm = loc_data.get("arm")
+
+        if loc_arm == "both" and arm_name is None:
+            parallel = step.get("parallel", True)
+            arm_names = [k for k in loc_data if k != "arm"]
+            if parallel and len(arm_names) > 1:
+                tasks = []
+                for name in arm_names:
+                    tasks.append((
+                        lambda n=name: arm(name=n).go_to(location, speed=speed, acc=acc, wait=True),
+                        (), {},
+                    ))
+                results = execute_parallel(tasks)
+                for code in results:
+                    if code != 0:
+                        raise RuntimeError(f"go_to (parallel) returned code {code}")
+            else:
+                for name in arm_names:
+                    code = arm(name=name).go_to(location, speed=speed, acc=acc, wait=True)
+                    if code != 0:
+                        arm(name=name).clear_error()
+                        raise RuntimeError(f"go_to returned code {code} for arm '{name}'")
+        else:
+            code = a.go_to(location, speed=speed, acc=acc, wait=True)
+            if code != 0:
+                if a.check_error():
+                    a.clear_error()
+                raise RuntimeError(f"go_to returned code {code}")
+
+    # ------------------------------------------------------------------
     elif step_type == "z_level":
         height = float(step.get("height") or step.get("z_level", 0))
         code = a.z_level(
@@ -181,6 +238,7 @@ def _execute_step(
             if a.check_error():
                 a.clear_error()
             raise RuntimeError(f"z_level returned code {code}")
+
     elif step_type == "move":
         rel = step.get("relative", [0, 0, 0])
         dx = float(rel[0]) if len(rel) > 0 else 0
@@ -194,6 +252,7 @@ def _execute_step(
             if a.check_error():
                 a.clear_error()
             raise RuntimeError(f"tool_move returned code {code}")
+
     elif step_type == "move_joint":
         rel = step.get("relative", [0] * 7)
         d_j = [float(rel[i]) if i < len(rel) else 0.0 for i in range(7)]
@@ -208,6 +267,8 @@ def _execute_step(
             if a.check_error():
                 a.clear_error()
             raise RuntimeError(f"joint_move returned code {code}")
+
+    # ------------------------------------------------------------------
     elif step_type == "move_to_object":
         presets = _object_presets_only(objects)
         obj_name = (step.get("object") or "").strip()
@@ -217,7 +278,10 @@ def _execute_step(
         shape = preset.get("shape", {})
         yolo_class = preset.get("yolo_class")
         conf_threshold = float(preset.get("confidence", objects.get("default_confidence", 0.25)))
-        kwargs = {
+        camera_arm = step.get("camera_arm")
+        if camera_arm is not None:
+            camera_arm = str(camera_arm).strip()
+        kwargs: Dict[str, Any] = {
             "shape": shape,
             "yolo_class": yolo_class,
             "pick_type": step.get("pick_type") or preset.get("pick_type", "toolhead_close"),
@@ -229,6 +293,8 @@ def _execute_step(
             "acc": float(step.get("acc", 500)),
             "display": step.get("display", True),
             "use_robot": True,
+            "arm_name": arm_name,
+            "camera_arm": camera_arm,
         }
         off = step.get("offset")
         if off is not None and len(off) >= 2:
@@ -236,11 +302,13 @@ def _execute_step(
         result = move_to_object(**kwargs)
         if not result.get("success"):
             raise RuntimeError(result.get("error", "move_to_object failed"))
+
     elif step_type == "z_level_object":
         presets = _object_presets_only(objects)
         obj_name = (step.get("object") or "").strip()
         if not obj_name or obj_name not in presets:
             raise ValueError(f"Unknown object '{obj_name}' (not in configs/objects.yaml)")
+        preset = objects[obj_name]
         z_offset = float(step.get("z_offset", 10.0))
         average_frames = int(step.get("average_frames", 5))
         pick_type = step.get("pick_type") or preset.get("pick_type", "toolhead_close")
@@ -254,17 +322,79 @@ def _execute_step(
             if a.check_error():
                 a.clear_error()
             raise RuntimeError(f"z_level_object returned code {code}")
+
+    # ------------------------------------------------------------------
     elif step_type == "grip":
         pos = step.get("state", 0)
         speed = step.get("speed")
         code = a.set_gripper_position(float(pos), wait=True, speed=float(speed) if speed is not None else None)
         if code != 0:
             raise RuntimeError(f"set_gripper_position returned code {code}")
+
     elif step_type == "sleep":
         import time
         secs = float(step.get("seconds") or step.get("sleep", 0))
         if secs > 0:
             time.sleep(secs)
+
+    # ------------------------------------------------------------------
+    elif step_type == "move_world":
+        from aira.coords import world_to_base
+        pos = step.get("position")
+        if pos is None or len(pos) < 3:
+            raise ValueError("move_world requires 'position' [x, y, z]")
+        p_world = np.array([float(pos[0]), float(pos[1]), float(pos[2])], dtype=np.float64)
+        target_arm = arm_name
+        p_base = world_to_base(p_world, target_arm or "default")
+        ori = step.get("orientation")
+        if ori and len(ori) >= 3:
+            roll, pitch, yaw = float(ori[0]), float(ori[1]), float(ori[2])
+        else:
+            _, cur_pose = a.get_position()
+            roll, pitch, yaw = float(cur_pose[3]), float(cur_pose[4]), float(cur_pose[5])
+        code = a._ctrl.move_to_absolute(
+            x=float(p_base[0]), y=float(p_base[1]), z=float(p_base[2]),
+            roll=roll, pitch=pitch, yaw=yaw,
+            speed=float(step.get("speed", 100)),
+            mvacc=float(step.get("acc", 500)),
+            wait=True,
+        )
+        if code != 0:
+            if a.check_error():
+                a.clear_error()
+            raise RuntimeError(f"move_world returned code {code}")
+
+    elif step_type == "move_other":
+        from aira.coords import base_to_base
+        pos = step.get("position")
+        if pos is None or len(pos) < 3:
+            raise ValueError("move_other requires 'position' [x, y, z]")
+        ref_arm = step.get("reference_arm")
+        if not ref_arm:
+            raise ValueError("move_other requires 'reference_arm'")
+        ref_arm = str(ref_arm).strip()
+        target_arm = arm_name
+        p_source = np.array([float(pos[0]), float(pos[1]), float(pos[2])], dtype=np.float64)
+        p_target = base_to_base(p_source, from_arm=ref_arm, to_arm=target_arm or "default")
+        ori = step.get("orientation")
+        if ori and len(ori) >= 3:
+            roll, pitch, yaw = float(ori[0]), float(ori[1]), float(ori[2])
+        else:
+            _, cur_pose = a.get_position()
+            roll, pitch, yaw = float(cur_pose[3]), float(cur_pose[4]), float(cur_pose[5])
+        code = a._ctrl.move_to_absolute(
+            x=float(p_target[0]), y=float(p_target[1]), z=float(p_target[2]),
+            roll=roll, pitch=pitch, yaw=yaw,
+            speed=float(step.get("speed", 100)),
+            mvacc=float(step.get("acc", 500)),
+            wait=True,
+        )
+        if code != 0:
+            if a.check_error():
+                a.clear_error()
+            raise RuntimeError(f"move_other returned code {code}")
+
+    # ------------------------------------------------------------------
     elif step_type == "run":
         file_ref = (step.get("file") or "").strip()
         if not file_ref:
@@ -284,8 +414,10 @@ def _execute_step(
                 raise RuntimeError("Stopped by user")
             _update_status(current_step_description=f"{run_description} (step {i + 1}/{len(sub_steps)})")
             _execute_step(sub_step, objects, merged_args, sub_path)
+
     elif step_type == "stop":
         raise RuntimeError(step.get("description") or "Stop step")
+
     else:
         raise ValueError(f"Unknown step type: {step_type}")
 

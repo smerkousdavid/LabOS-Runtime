@@ -1,26 +1,26 @@
 """
-Robot singleton and move commands.
+Robot multi-arm registry and move commands.
 
-arm() - global robot singleton (xArm). Connect with arm(ip=...).
-arm().load_ref_frame('home.json') - load reference frame for home() and z_level; tool_move is always relative to current tool.
-arm().home() - move to loaded reference (home) pose.
-arm().go_to('location_name') - move to saved location (locations/<name>.json).
-arm().tool_move(dx, dy, dz=0, ...) - move relative to current tool frame (unchanged by ref frame).
-arm().tool_z_move(height_mm_above_table, ...) - move TCP Z to z0 + height (base frame).
-arm().z_level(height=100) - set TCP Z to z0 + height above reference ground plane.
-arm().z_level_object(object_name, z_offset=10) - set TCP Z to z_offset mm above detected object.
-arm().z_down() - orient tool Z down, X/Y parallel to base (roll=180, pitch=0, yaw=0).
-move_to_object(...) - uses singletons (camera, yolo, calibration) and arm() for moves.
-start_vision_display() - start camera + YOLO viewer in a background thread (call at program start to avoid blocking on key).
+Supports one or more xArm robots via configs/robot_mapping.json.
+When no mapping exists, falls back to a single "default" arm (backward compatible).
+
+arm()            - default arm (backward compat)
+arm("left")      - named arm from robot_mapping.json
+arm().go_to(...) - move to saved location
+arm().tool_move(dx, dy, ...) - move relative to current tool frame
+move_to_object(arm_name=..., camera_arm=...) - vision-guided, optionally cross-arm
+execute_parallel(tasks) - run blocking commands on multiple arms concurrently
+start_vision_display() - camera + YOLO viewer in background thread
 """
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Tuple, List, Any, Dict, Union
+from typing import Optional, Tuple, List, Any, Dict, Union, Callable
 import numpy as np
 import cv2
 
@@ -160,15 +160,114 @@ class XArmController:
                 pass
 
 
-_arm_singleton: Optional[XArmController] = None
-_arm_ip: Optional[str] = None
-
 BASE = get_project_root()
 
 VISION_WINDOW_NAME = "Vision"
-# Fit combined color+depth view within 1080p (one dimension may be smaller)
 VISION_MAX_WIDTH = 1920
 VISION_MAX_HEIGHT = 1080
+
+
+# ---------------------------------------------------------------------------
+# Robot mapping config
+# ---------------------------------------------------------------------------
+
+def load_robot_mapping() -> Dict[str, Dict[str, Any]]:
+    """Load configs/robot_mapping.json. Returns arm-name -> config dict.
+    Falls back to a single 'default' entry built from XARM_IP / legacy defaults."""
+    path = BASE / "configs" / "robot_mapping.json"
+    if path.exists():
+        try:
+            with open(path, "r") as f:
+                mapping = json.load(f)
+            if isinstance(mapping, dict) and mapping:
+                return mapping
+        except Exception:
+            pass
+    ip = os.environ.get("XARM_IP") or _default_robot_ip()
+    return {
+        "default": {
+            "ip": ip,
+            "has_camera": True,
+            "camera_device": 0,
+            "camera_calibration": "configs/handeye_calibration_result.json",
+            "camera_intrinsics": "calibration_images/calibration_matrix.npy",
+            "camera_distortion": "calibration_images/distortion_coefficients.npy",
+            "handeye_data": "configs/handeye_calibration_data.json",
+            "tare": "configs/tare.json",
+            "on_linear_rail": False,
+        }
+    }
+
+
+class ArmRegistry:
+    """Manages multiple XArmController instances keyed by name (e.g. 'left', 'right').
+    Arms connect lazily on first access."""
+
+    def __init__(self):
+        self._controllers: Dict[str, XArmController] = {}
+        self._proxies: Dict[str, ArmProxy] = {}
+        self._config: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._load_config()
+
+    def _load_config(self) -> None:
+        self._config = load_robot_mapping()
+
+    def arm_names(self) -> List[str]:
+        return list(self._config.keys())
+
+    def default_name(self) -> str:
+        names = self.arm_names()
+        if "default" in names:
+            return "default"
+        return names[0] if names else "default"
+
+    def arm_config(self, name: str) -> Dict[str, Any]:
+        if name not in self._config:
+            raise KeyError(f"Unknown arm '{name}'. Available: {self.arm_names()}")
+        return dict(self._config[name])
+
+    def get(self, arm_name: Optional[str] = None, ip: Optional[str] = None) -> "ArmProxy":
+        """Return ArmProxy for the named arm. Connects on first call."""
+        if arm_name is None:
+            arm_name = self.default_name()
+        with self._lock:
+            if arm_name in self._proxies:
+                return self._proxies[arm_name]
+            cfg = self._config.get(arm_name)
+            if cfg is None:
+                if ip is not None:
+                    cfg = {"ip": ip, "has_camera": False}
+                    self._config[arm_name] = cfg
+                else:
+                    raise KeyError(f"Unknown arm '{arm_name}'. Available: {self.arm_names()}")
+            arm_ip = ip or cfg.get("ip") or _default_robot_ip()
+            if not HAS_XARM:
+                raise RuntimeError("xArm SDK not available")
+            ctrl = XArmController(arm_ip)
+            if not ctrl.connect():
+                raise RuntimeError(f"Failed to connect to arm '{arm_name}' at {arm_ip}")
+            self._controllers[arm_name] = ctrl
+            proxy = ArmProxy(ctrl, name=arm_name)
+            self._proxies[arm_name] = proxy
+            return proxy
+
+    def reset(self, arm_name: Optional[str] = None) -> None:
+        """Disconnect and remove one or all arms."""
+        with self._lock:
+            names = [arm_name] if arm_name else list(self._controllers.keys())
+            for name in names:
+                ctrl = self._controllers.pop(name, None)
+                self._proxies.pop(name, None)
+                if ctrl is not None:
+                    try:
+                        ctrl.disconnect()
+                    except Exception:
+                        pass
+
+
+_registry: Optional[ArmRegistry] = None
+_registry_lock = threading.Lock()
 
 
 def _mode_depth_mm(
@@ -429,38 +528,82 @@ def _default_robot_ip() -> str:
     return "192.168.1.195"
 
 
-def _get_controller(ip: Optional[str] = None) -> XArmController:
-    """Get or create global robot controller. First call connects."""
-    global _arm_singleton, _arm_ip
-    if ip is not None:
-        _arm_ip = ip
-    if _arm_ip is None:
-        _arm_ip = _default_robot_ip()
-    if _arm_singleton is not None:
-        return _arm_singleton
-    if not HAS_XARM or XArmController is None:
-        raise RuntimeError("xArm not available")
-    _arm_singleton = XArmController(_arm_ip)
-    if not _arm_singleton.connect():
-        _arm_singleton = None
-        raise RuntimeError("Failed to connect to robot")
-    return _arm_singleton
+def load_location(location_name: str) -> Dict[str, Any]:
+    """Load a location JSON file by name (without .json suffix) from locations/.
+    Returns the full dict including any 'arm' metadata."""
+    name = str(location_name).strip()
+    if not name:
+        raise ValueError("location_name cannot be empty")
+    if not name.endswith(".json"):
+        name = name + ".json"
+    path = BASE / "locations" / name
+    if not path.exists():
+        raise FileNotFoundError(f"Location file not found: {path}")
+    with open(path, "r") as f:
+        return json.load(f)
 
 
-def arm(ip: Optional[str] = None) -> "ArmProxy":
-    """Return global robot singleton as ArmProxy (tool_move, tool_z_move). First call connects."""
-    return ArmProxy(_get_controller(ip))
+def _get_registry() -> ArmRegistry:
+    """Return (or create) the global ArmRegistry singleton."""
+    global _registry
+    if _registry is not None:
+        return _registry
+    with _registry_lock:
+        if _registry is not None:
+            return _registry
+        _registry = ArmRegistry()
+        return _registry
 
 
-def reset_arm():
-    """Disconnect and clear arm singleton."""
-    global _arm_singleton
-    if _arm_singleton is not None:
-        try:
-            _arm_singleton.disconnect()
-        except Exception:
-            pass
-        _arm_singleton = None
+def arm(name: Optional[str] = None, ip: Optional[str] = None) -> "ArmProxy":
+    """Return ArmProxy for the named arm. Backward compatible: arm() returns the default arm.
+    arm("left") returns the left arm, etc."""
+    return _get_registry().get(arm_name=name, ip=ip)
+
+
+def get_arm_config(name: Optional[str] = None) -> Dict[str, Any]:
+    """Return the robot_mapping.json config for the given arm (or default)."""
+    reg = _get_registry()
+    return reg.arm_config(name or reg.default_name())
+
+
+def get_arm_names() -> List[str]:
+    """Return all configured arm names."""
+    return _get_registry().arm_names()
+
+
+def reset_arm(name: Optional[str] = None) -> None:
+    """Disconnect and clear one arm (by name) or all arms (name=None)."""
+    if _registry is not None:
+        _registry.reset(name)
+
+
+def execute_parallel(
+    tasks: List[Tuple[Callable, tuple, dict]],
+) -> List[Any]:
+    """Run blocking callables in parallel threads, join, collect results.
+    tasks: list of (callable, args, kwargs). Each callable typically wraps an
+    arm command like ``lambda: arm('left').go_to('home')``.
+    Raises the first error encountered (after all threads have joined)."""
+    results: List[Any] = [None] * len(tasks)
+    errors: List[Optional[BaseException]] = [None] * len(tasks)
+    threads: List[threading.Thread] = []
+    for i, (fn, args, kwargs) in enumerate(tasks):
+        def _worker(idx: int = i, _fn: Callable = fn,
+                    _args: tuple = args, _kw: dict = kwargs) -> None:
+            try:
+                results[idx] = _fn(*_args, **_kw)
+            except Exception as exc:
+                errors[idx] = exc
+        t = threading.Thread(target=_worker)
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+    for err in errors:
+        if err is not None:
+            raise err
+    return results
 
 
 def _rpy_deg_to_rotation_matrix(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
@@ -496,8 +639,9 @@ def _rotation_matrix_to_rpy_deg(R: np.ndarray) -> Tuple[float, float, float]:
 class ArmProxy:
     """Thin wrapper so arm().tool_move(...), arm().home(), arm().load_ref_frame(...) work; also exposes .arm for raw API."""
 
-    def __init__(self, controller: XArmController):
+    def __init__(self, controller: XArmController, name: str = "default"):
         self._ctrl = controller
+        self.name = name
         self.arm = controller.arm  # raw xArm API if needed
         self._ref_frame: Optional[Dict[str, Any]] = None  # loaded home pose for relative moves
 
@@ -552,17 +696,27 @@ class ArmProxy:
         """
         Move to a saved location by name. Looks for locations/<name>.json under project root.
         Uses joint angles when present for a stable path, otherwise cartesian pose.
+        For bimanual locations ("arm": "both"), extracts this arm's sub-entry.
         """
-        name = str(location_name).strip()
-        if not name:
-            raise ValueError("location_name cannot be empty")
-        if not name.endswith(".json"):
-            name = name + ".json"
-        path = BASE / "locations" / name
-        if not path.exists():
-            raise FileNotFoundError(f"Location file not found: {path}")
-        with open(path, "r") as f:
-            data = json.load(f)
+        data = load_location(location_name)
+        arm_field = data.get("arm")
+        if arm_field == "both":
+            sub = data.get(self.name)
+            if sub is None:
+                raise ValueError(
+                    f"Bimanual location '{location_name}' has no entry for arm '{self.name}'"
+                )
+            data = sub
+        return self._go_to_data(data, speed=speed, acc=acc, wait=wait)
+
+    def _go_to_data(
+        self,
+        data: Dict[str, Any],
+        speed: float = 250,
+        acc: float = 600,
+        wait: bool = True,
+    ) -> int:
+        """Move to a pose described by a location dict (pose + optional joint_angles_deg)."""
         pose = data.get("pose")
         if pose is None:
             pos = data.get("position_mm", [])
@@ -571,7 +725,7 @@ class ArmProxy:
                 pose = [float(pos[0]), float(pos[1]), float(pos[2]),
                         float(ori[0]), float(ori[1]), float(ori[2])]
         if not pose or len(pose) < 6:
-            raise ValueError("Location JSON must contain 'pose' (6 floats) or 'position_mm' + 'orientation_deg'")
+            raise ValueError("Location data must contain 'pose' (6 floats) or 'position_mm' + 'orientation_deg'")
         joints = data.get("joint_angles_deg")
         if joints and len(joints) >= 7:
             return self.arm.set_servo_angle(
@@ -904,9 +1058,9 @@ class ArmProxy:
         return self._ctrl.get_gripper_position()
 
 
-def arm_proxy(ip: Optional[str] = None) -> ArmProxy:
-    """Return arm singleton wrapped as ArmProxy (tool_move, tool_z_move)."""
-    return ArmProxy(arm(ip))
+def arm_proxy(name: Optional[str] = None, ip: Optional[str] = None) -> ArmProxy:
+    """Return arm wrapped as ArmProxy (backward-compat alias for arm())."""
+    return arm(name=name, ip=ip)
 
 
 def _load_objects_for_robot() -> Dict[str, Any]:
@@ -1258,14 +1412,19 @@ def move_to_object(
     tare_mm: Optional[Tuple[float, float, float]] = None,
     offset: Optional[Tuple[float, ...]] = None,
     ignore_z: bool = True,
+    arm_name: Optional[str] = None,
+    camera_arm: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Move toolhead to the selected object using global camera, yolo, calibration singletons and arm().
-    offset: (dx, dy) or (dx, dy, dz) in mm added to object position (e.g. (50, 0) to be 50mm in front).
-    use_robot: if True, use arm() for moves; if False, display only.
-    robot_ip: IP for arm() when use_robot (default from handeye_calibration_data.json).
-    tare_mm: optional override for calibration tare (else from calibration singleton).
-    ignore_z: if True (default), only move in x,y; dz is forced to 0 (no up/down). If False, use offset z.
+    Move toolhead to the selected object using camera, yolo, calibration and arm().
+
+    arm_name: which arm to move (default: default arm).
+    camera_arm: which arm's camera to use for detection (default: same as arm_name).
+        When camera_arm != arm_name, the cross-arm pipeline is used:
+        camera -> EE -> camera_arm base -> world -> arm_name base -> absolute move.
+
+    offset: (dx, dy) or (dx, dy, dz) in mm added to object position.
+    ignore_z: if True (default), only move in x,y; dz is forced to 0.
     """
     from aira.vision.vision import (
         parse_shape,
@@ -1277,10 +1436,28 @@ def move_to_object(
     from aira.vision.dataset import get_class_names
     from aira.vision.singletons import camera, yolo, calibration
 
-    cal = calibration()
+    effective_camera_arm = camera_arm or arm_name
+    effective_arm_name = arm_name
+
+    # Validate camera availability
+    if effective_camera_arm is not None:
+        try:
+            cfg = get_arm_config(effective_camera_arm)
+            if not cfg.get("has_camera", True):
+                return {
+                    "success": False, "final_xy_tool_mm": None, "moves_done": 0,
+                    "error": f"Camera not available for arm '{effective_camera_arm}'",
+                }
+        except KeyError:
+            pass
+
+    cross_arm = (effective_camera_arm is not None
+                 and effective_arm_name is not None
+                 and effective_camera_arm != effective_arm_name)
+
+    cal = calibration(arm_name=effective_camera_arm)
     T_cam_to_tool = cal["T_cam_to_tool"]
     K = cal["K"]
-    D = cal["D"]
     tare_arr = np.array(tare_mm if tare_mm is not None else cal["tare_mm"], dtype=np.float64)
     shape_norm = parse_shape(shape)
 
@@ -1296,11 +1473,11 @@ def move_to_object(
         ]
     cls_idx = resolve_class_to_index(classes, yolo_class)
 
-    cam = camera() if use_camera_singleton else None
+    cam = camera(arm_name=effective_camera_arm) if use_camera_singleton else None
     if cam is None:
         return {"success": False, "final_xy_tool_mm": None, "moves_done": 0, "error": "camera not available"}
 
-    robot = arm(robot_ip) if use_robot else None
+    robot = arm(name=effective_arm_name, ip=robot_ip) if use_robot else None
 
     use_global_viewer = False
     if display:
@@ -1317,9 +1494,9 @@ def move_to_object(
         for move_idx in range(repeat):
             if user_quit:
                 break
-            # Use original pick_type for first move, then 'toolhead_close' for corrections
             current_pick_type = pick_type if move_idx == 0 else "toolhead_close"
             buffer_xy: List[Tuple[float, float]] = []
+            buffer_base: List[np.ndarray] = []
             if use_global_viewer:
                 while True:
                     try:
@@ -1364,7 +1541,10 @@ def move_to_object(
                 chosen = pick_detection(detections, current_pick_type, color_image.shape, T_cam_to_tool, tare_arr)
                 if chosen is not None and chosen.get("p_tool_mm") is not None:
                     p = chosen["p_tool_mm"]
-                    buffer_xy.append((float(p[0]), float(p[1])))
+                    if cross_arm:
+                        buffer_base.append(np.array([p[0], p[1], p[2]], dtype=np.float64))
+                    else:
+                        buffer_xy.append((float(p[0]), float(p[1])))
                 if display and not use_global_viewer and color_image is not None:
                     disp = color_image.copy()
                     for d in detections:
@@ -1376,12 +1556,37 @@ def move_to_object(
                             pt = chosen["p_tool_mm"]
                             cv2.putText(disp, f"Tool: [{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}] mm",
                                         (int(b[0]), int(b[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(disp, f"Move {move_idx + 1}/{repeat} | buffer {len(buffer_xy)}/{average_frames} | conf={conf_threshold:.2f} | q=quit", (10, 30),
+                    cv2.putText(disp, f"Move {move_idx + 1}/{repeat} | buffer {len(buffer_xy) or len(buffer_base)}/{average_frames} | conf={conf_threshold:.2f} | q=quit", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     cv2.imshow("Center on Object", disp)
                     if cv2.waitKey(30) & 0xFF == ord("q"):
                         user_quit = True
                         break
+
+            if cross_arm and buffer_base:
+                from aira.coords import camera_to_other_base
+                avg_tool = np.mean(np.array(buffer_base), axis=0)
+                _, cam_pose = arm(name=effective_camera_arm).get_position()
+                p_target = camera_to_other_base(
+                    avg_tool, from_arm=effective_camera_arm, to_arm=effective_arm_name,
+                    ee_pose=cam_pose, T_cam_to_ee=T_cam_to_tool, tare=tuple(tare_arr),
+                    from_rail_pos=None, to_rail_pos=None,
+                )
+                if robot is not None:
+                    code, cur_pose = robot.get_position()
+                    if code == 0:
+                        code = robot._ctrl.move_to_absolute(
+                            x=float(p_target[0]), y=float(p_target[1]),
+                            z=float(cur_pose[2]) if ignore_z else float(p_target[2]),
+                            roll=float(cur_pose[3]), pitch=float(cur_pose[4]), yaw=float(cur_pose[5]),
+                            speed=speed, mvacc=acc, wait=True,
+                        )
+                        if code == 0:
+                            moves_done += 1
+                        elif robot.check_error():
+                            robot.clear_error()
+                final_xy_tool_mm = (float(p_target[0]), float(p_target[1]))
+                continue
 
             if not buffer_xy:
                 if display and not use_global_viewer:

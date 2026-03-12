@@ -128,7 +128,7 @@ services:
     environment:
       - NAT_SERVER_URL={{ nat_server_url }}
       - CAMERA_INDEX={{ i+1 }}
-      - SESSION_ID=labos-runtime-{{ runtime_session_suffix }}-{{ i+1 }}
+      - SESSION_ID={{ device_id }}-{{ i+1 }}
       - MEDIAMTX_HOST={{ mediamtx_service_name }}
       - RECORDING_ENABLED={{ 'true' if recording_enabled else 'false' }}
       - RECORDINGS_PATH=/app/recordings

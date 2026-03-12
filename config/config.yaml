@@ -126,7 +126,7 @@ frame_streaming:
 # LabOS Live Session -- QR code scanning and RTSP relay
 # ---------------------------------------------------------------------------
 labos_live:
-  initial_qr_code: false                  # show QR scanning prompt on XR startup
+  initial_qr_code: true                   # show QR scanning prompt on XR startup
 
 # ---------------------------------------------------------------------------
 # RTSP external access

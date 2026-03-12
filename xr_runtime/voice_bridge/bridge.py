@@ -21,7 +21,6 @@ import base64
 import audioop
 import json
 import os
-import secrets
 import signal
 import subprocess
 import sys
@@ -70,14 +69,7 @@ _SUPPRESSED_TOOLS: set = _load_tool_filter()
 
 NAT_SERVER_URL = os.environ.get("NAT_SERVER_URL", "ws://localhost:8002/ws")
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "1"))
-
-
-def _default_session_id() -> str:
-    """Unique per-runtime session id: labos-runtime-<random_hex>-<camera_index>."""
-    return f"labos-runtime-{secrets.token_hex(4)}-{CAMERA_INDEX}"
-
-
-SESSION_ID = os.environ.get("SESSION_ID", _default_session_id())
+SESSION_ID = os.environ.get("SESSION_ID", f"labos-{CAMERA_INDEX}")
 MEDIAMTX_HOST = os.environ.get("MEDIAMTX_HOST", "mediamtx")
 STT_HOST = os.environ.get("STT_HOST", "localhost")
 STT_PORT = int(os.environ.get("STT_PORT", "50051"))
@@ -704,20 +696,40 @@ def _has_live_xr_frame() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# QR Code scanning
+# QR Code scanning -- state machine and single-task management
 # ---------------------------------------------------------------------------
 
 _qr_scanning_active = False
+_qr_scan_current_task: Optional[asyncio.Task] = None
+_qr_session_state = "IDLE"  # IDLE | SCANNING | CONNECTING | LIVE
+_qr_cooldown_until: float = 0.0
+QR_SESSION_COOLDOWN_S = 15.0
+_QR_DEDUP_COOLDOWN_S = 5.0
+_last_sent_qr: Optional[str] = None
+_last_sent_qr_ts: float = 0.0
+
 _rtsp_relay_proc = None
 _QR_SHOW_COMMANDS = {"show qr code", "show qr"}
 _QR_QUIT_COMMANDS = {"quit app"}
+_SESSION_RESTART_COMMANDS = {"restart session", "reset session", "restart", "new session"}
+_SESSION_QUIT_COMMANDS = {"quit session", "end session", "stop session"}
+
+# Reference to main-loop locals needed by _reset_glass_session.
+# Populated once inside main().
+_bridge_ctx: Dict[str, Any] = {}
+_glasses_connected = False
+
+
+def _set_qr_state(new_state: str):
+    global _qr_session_state
+    old = _qr_session_state
+    _qr_session_state = new_state
+    if old != new_state:
+        logger.info(f"[QR] State: {old} -> {new_state}")
 
 
 def _decode_qr(frame) -> list[str]:
-    """Decode QR codes from a frame using pyzbar (primary) or OpenCV (fallback).
-
-    Returns a list of decoded string payloads (may be empty).
-    """
+    """Decode QR codes from a frame using pyzbar (primary) or OpenCV (fallback)."""
     try:
         from pyzbar.pyzbar import decode as zbar_decode, ZBarSymbol
         results = zbar_decode(frame, symbols=[ZBarSymbol.QRCODE])
@@ -740,10 +752,24 @@ def _decode_qr(frame) -> list[str]:
     return []
 
 
+def _is_valid_qr_payload(payload: dict) -> bool:
+    """Accept multiple QR formats for LabOS Live."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("t") == "ll":
+        return True
+    if payload.get("type") == "labos_live":
+        return True
+    if "h" in payload and "s" in payload:
+        return True
+    return False
+
+
 async def _qr_scan_task(ws_client: NATWebSocketClient):
     """Scan camera for QR codes at ~4 FPS, show preview on AR panel."""
-    global _qr_scanning_active
+    global _qr_scanning_active, _last_sent_qr, _last_sent_qr_ts, _qr_cooldown_until
     _qr_scanning_active = True
+    _set_qr_state("SCANNING")
     import cv2
     interval = 0.25
     panel_resend_interval = 2.0
@@ -751,17 +777,26 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
     last_panel_send_ts = 0.0
     _prompt_msg = (
         "<size=16><color=#59D2FF>Point at the QR code on screen</color></size>"
-        '<size=14><color=#CCCCCC>\nSay "show qr code" or "quit app" to restart session</color></size>'
+        '<size=14><color=#CCCCCC>\nSay "restart session" or "quit session" to manage session</color></size>'
     )
     _waiting_msg = (
         '<size=16><color=#888888>Waiting for camera...</color></size>'
-        '<size=14><color=#CCCCCC>\nSay "show qr code" or "quit app"</color></size>'
+        '<size=14><color=#CCCCCC>\nSay "restart session" or "quit session"</color></size>'
     )
 
     logger.info("[QR] QR code scanning started")
 
     while _qr_scanning_active:
         try:
+            if not _glasses_connected:
+                await asyncio.sleep(0.5)
+                continue
+
+            now = time.monotonic()
+            if now < _qr_cooldown_until:
+                await asyncio.sleep(0.5)
+                continue
+
             conn = _get_xr_connection()
             frame = None
             if conn is not None:
@@ -777,23 +812,53 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
                 decoded_list = _decode_qr(frame)
                 for data in decoded_list:
                     logger.info(f"[QR] Decoded payload: {data[:200]}")
+
+                    if (
+                        _last_sent_qr == data
+                        and (now - _last_sent_qr_ts) < _QR_DEDUP_COOLDOWN_S
+                    ):
+                        logger.debug("[QR] Skipping duplicate QR within dedup window")
+                        continue
+
                     try:
                         payload = json.loads(data)
                     except (json.JSONDecodeError, TypeError):
-                        logger.info(f"[QR] Non-JSON QR detected (raw string), sending as-is")
-                        payload = {"t": "ll", "raw": data}
+                        logger.info("[QR] Non-JSON QR detected (raw string), sending as pairing code")
+                        if len(data) >= 4:
+                            payload = {"t": "ll", "raw": data}
+                        else:
+                            continue
 
-                    if isinstance(payload, dict) and payload.get("t") == "ll":
-                        session_id = payload.get("session_id", "?")
-                        logger.info(f"[QR] Matched LabOS QR: session={session_id}")
-                        await ws_client.send({
+                    if _is_valid_qr_payload(payload):
+                        logger.info(
+                            f"[QR] Matched LabOS QR -- sending qr_payload to NAT:\n"
+                            f"  payload: {json.dumps(payload, indent=2)}\n"
+                            f"  ws connected: {ws_client.connected}"
+                        )
+                        _last_sent_qr = data
+                        _last_sent_qr_ts = now
+                        _qr_scanning_active = False
+                        _set_qr_state("CONNECTING")
+
+                        connecting_msg = json.dumps({"messages": [
+                            {"type": "rich-text", "content": (
+                                '<size=20><color=#59D2FF>CONNECTING to live session...</color></size>'
+                            )},
+                        ]})
+                        await _send_to_glasses("SINGLE_STEP_PANEL_CONTENT", connecting_msg)
+
+                        sent = await ws_client.send({
                             "type": "qr_payload",
                             "payload": payload,
                         })
-                        _qr_scanning_active = False
+                        if sent:
+                            logger.info("[QR] qr_payload sent to NAT successfully, waiting for session_connected...")
+                        else:
+                            logger.error("[QR] Failed to send qr_payload to NAT (WS not connected?)")
+                        _qr_cooldown_until = now + QR_SESSION_COOLDOWN_S
                         break
                     else:
-                        logger.info(f"[QR] Ignoring QR -- type={payload.get('t', 'N/A')!r} (expected 'labos_live')")
+                        logger.info(f"[QR] Ignoring QR -- unrecognized format: {payload}")
 
                 if not _qr_scanning_active:
                     break
@@ -812,7 +877,6 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
 
             panel_payload = json.dumps({"messages": messages})
             now = time.monotonic()
-            # Avoid flooding gRPC queue with identical panel payloads while in QR loop.
             should_send_panel = (
                 panel_payload != last_panel_payload
                 or (now - last_panel_send_ts) >= panel_resend_interval
@@ -834,97 +898,302 @@ async def _qr_scan_task(ws_client: NATWebSocketClient):
 
 
 def stop_qr_scanning():
-    global _qr_scanning_active
+    """Stop QR scanning: clear flag AND cancel the running task."""
+    global _qr_scanning_active, _qr_scan_current_task
     _qr_scanning_active = False
+    if _qr_scan_current_task is not None and not _qr_scan_current_task.done():
+        _qr_scan_current_task.cancel()
+        _qr_scan_current_task = None
 
 
-def start_qr_scanning():
-    global _qr_scanning_active
+def _launch_qr_scan(ws_client: NATWebSocketClient, *, force: bool = False):
+    """Cancel any existing QR task and start a fresh one."""
+    global _qr_scan_current_task, _qr_scanning_active, _qr_cooldown_until
+    stop_qr_scanning()
+    if force:
+        _qr_cooldown_until = 0.0
+    elif time.monotonic() < _qr_cooldown_until:
+        logger.info("[QR] Skipping launch -- still in cooldown")
+        return
     _qr_scanning_active = True
+    _qr_scan_current_task = asyncio.create_task(_qr_scan_task(ws_client))
 
 
 # ---------------------------------------------------------------------------
 # RTSP relay to LabOS server
 # ---------------------------------------------------------------------------
 
-async def _start_rtsp_relay(local_rtsp_path: str, publish_rtsp: str):
-    """Start FFmpeg process to relay local RTSP stream to remote URL."""
-    global _rtsp_relay_proc
-    await _stop_rtsp_relay()
+_rtsp_relay_monitor_task: Optional[asyncio.Task] = None
+_RTSP_RELAY_TIMEOUT_S = float(os.environ.get("RTSP_RELAY_TIMEOUT_S", "180"))
+_RTSP_RELAY_RETRY_DELAY = 2.0
+_rtsp_relay_ws_client: Optional[object] = None
 
-    local_url = f"rtsp://localhost:8554/{local_rtsp_path}"
+
+async def _drain_stderr(proc: asyncio.subprocess.Process, label: str):
+    """Read ffmpeg stderr line-by-line and log at WARNING level."""
+    assert proc.stderr is not None
+    while True:
+        line = await proc.stderr.readline()
+        if not line:
+            break
+        logger.warning(f"[RTSP] {label}: {line.decode(errors='replace').rstrip()}")
+
+
+async def _start_rtsp_relay(
+    local_rtsp_path: str, publish_rtsp: str, ws_client=None,
+):
+    """Start FFmpeg relay with automatic retry while the WS connection is alive."""
+    global _rtsp_relay_proc, _rtsp_relay_monitor_task, _rtsp_relay_ws_client
+    await _stop_rtsp_relay()
+    _rtsp_relay_ws_client = ws_client
+
+    local_url = f"rtsp://{MEDIAMTX_HOST}:8554/{local_rtsp_path}"
     cmd = [
         "ffmpeg", "-y",
+        "-fflags", "nobuffer+genpts",
+        "-flags", "low_delay",
+        "-probesize", "5000000",
+        "-analyzeduration", "3000000",
+        "-rtbufsize", "2M",
         "-rtsp_transport", "tcp",
         "-i", local_url,
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-avoid_negative_ts", "make_zero",
         "-f", "rtsp",
+        "-rtsp_transport", "tcp",
         publish_rtsp,
     ]
-    logger.info(f"[RTSP] Starting relay: {local_url} -> {publish_rtsp}")
-    try:
-        _rtsp_relay_proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+    logger.info(
+        f"[RTSP] Relay config:\n"
+        f"  local  : {local_url}\n"
+        f"  remote : {publish_rtsp}\n"
+        f"  timeout: {_RTSP_RELAY_TIMEOUT_S}s\n"
+        f"  cmd    : {' '.join(cmd)}"
+    )
+
+    async def _ws_alive() -> bool:
+        if _rtsp_relay_ws_client is None:
+            return True
+        return getattr(_rtsp_relay_ws_client, "connected", True)
+
+    async def _run_with_retry():
+        global _rtsp_relay_proc
+        start = time.monotonic()
+        attempt = 0
+        while (time.monotonic() - start) < _RTSP_RELAY_TIMEOUT_S:
+            if not await _ws_alive():
+                logger.info("[RTSP] WS disconnected -- stopping relay retries")
+                break
+            attempt += 1
+            elapsed = time.monotonic() - start
+            logger.info(
+                f"[RTSP] Starting relay attempt {attempt} "
+                f"({elapsed:.0f}s / {_RTSP_RELAY_TIMEOUT_S:.0f}s limit): "
+                f"{local_url} -> {publish_rtsp}"
+            )
+            try:
+                _rtsp_relay_proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except Exception as exc:
+                logger.error(f"[RTSP] Failed to spawn ffmpeg: {exc}")
+                _rtsp_relay_proc = None
+                await asyncio.sleep(_RTSP_RELAY_RETRY_DELAY)
+                continue
+
+            logger.info(f"[RTSP] Relay started (pid={_rtsp_relay_proc.pid})")
+            stderr_task = asyncio.create_task(_drain_stderr(_rtsp_relay_proc, "ffmpeg"))
+
+            exit_code = await _rtsp_relay_proc.wait()
+            await stderr_task
+
+            if exit_code == 0:
+                logger.info("[RTSP] Relay exited cleanly (exit_code=0)")
+                _rtsp_relay_proc = None
+                return
+
+            logger.warning(
+                f"[RTSP] Relay exited (exit_code={exit_code}, "
+                f"pid={_rtsp_relay_proc.pid})"
+            )
+            _rtsp_relay_proc = None
+
+            remaining = _RTSP_RELAY_TIMEOUT_S - (time.monotonic() - start)
+            if remaining > _RTSP_RELAY_RETRY_DELAY:
+                logger.info(
+                    f"[RTSP] Retrying in {_RTSP_RELAY_RETRY_DELAY}s "
+                    f"({remaining:.0f}s remaining)..."
+                )
+                await asyncio.sleep(_RTSP_RELAY_RETRY_DELAY)
+
+        elapsed = time.monotonic() - start
+        logger.error(
+            f"[RTSP] Relay gave up after {attempt} attempts / {elapsed:.0f}s"
         )
-        logger.info(f"[RTSP] Relay started (pid={_rtsp_relay_proc.pid})")
-    except Exception as exc:
-        logger.error(f"[RTSP] Failed to start relay: {exc}")
-        _rtsp_relay_proc = None
+
+    _rtsp_relay_monitor_task = asyncio.create_task(_run_with_retry())
+    logger.info("[RTSP] Relay monitor task launched")
 
 
 async def _stop_rtsp_relay():
-    """Stop the RTSP relay FFmpeg process."""
-    global _rtsp_relay_proc
+    """Stop the RTSP relay FFmpeg process and cancel the monitor task."""
+    global _rtsp_relay_proc, _rtsp_relay_monitor_task
+
+    if _rtsp_relay_monitor_task is not None:
+        logger.info("[RTSP] Cancelling relay monitor task")
+        _rtsp_relay_monitor_task.cancel()
+        try:
+            await _rtsp_relay_monitor_task
+        except asyncio.CancelledError:
+            pass
+        _rtsp_relay_monitor_task = None
+
     if _rtsp_relay_proc is not None:
+        pid = _rtsp_relay_proc.pid
+        logger.info(f"[RTSP] Terminating relay process (pid={pid})")
         try:
             _rtsp_relay_proc.terminate()
             await asyncio.wait_for(_rtsp_relay_proc.wait(), timeout=5.0)
+            logger.info(f"[RTSP] Relay process terminated (pid={pid})")
         except (asyncio.TimeoutError, ProcessLookupError):
+            logger.warning(f"[RTSP] Relay did not terminate gracefully, killing (pid={pid})")
             try:
                 _rtsp_relay_proc.kill()
             except ProcessLookupError:
                 pass
-        logger.info("[RTSP] Relay stopped")
         _rtsp_relay_proc = None
+    else:
+        logger.debug("[RTSP] No relay process to stop")
 
+
+# ---------------------------------------------------------------------------
+# Centralized per-glass session reset
+# ---------------------------------------------------------------------------
+
+async def _reset_glass_session(
+    ws_client: NATWebSocketClient,
+    *,
+    reset_ws: bool,
+    restart_qr: bool,
+    reason: str,
+):
+    """Full per-glass state teardown. Only affects this camera's bridge."""
+    global _last_display_update
+    logger.info(
+        f"[Session] Resetting glass session:\n"
+        f"  reason    : {reason}\n"
+        f"  reset_ws  : {reset_ws}\n"
+        f"  restart_qr: {restart_qr}\n"
+        f"  qr_state  : {_qr_session_state}\n"
+        f"  relay_proc: {_rtsp_relay_proc is not None}\n"
+        f"  recorder  : {_recorder.running if _recorder else 'N/A'}"
+    )
+    stop_qr_scanning()
+    await _stop_rtsp_relay()
+
+    ctx = _bridge_ctx
+    stt = ctx.get("stt")
+    accumulator = ctx.get("accumulator")
+    ww_filter = ctx.get("ww_filter")
+
+    if stt:
+        await stt.stop_stream()
+    if accumulator:
+        accumulator._buffer.clear()
+    if ww_filter:
+        ww_filter.reset()
+    _tts_cancel.set()
+
+    if _recorder and _recorder.running:
+        _recorder.log_data(f"Session reset: {reason}")
+        _recorder.stop()
+
+    _last_display_update = None
+
+    if reset_ws:
+        await ws_client.reset_session()
+
+    if restart_qr and INITIAL_QR_CODE:
+        _set_qr_state("SCANNING")
+        _launch_qr_scan(ws_client, force=True)
+    elif not restart_qr:
+        _set_qr_state("IDLE")
+
+
+# ---------------------------------------------------------------------------
+# Session event handlers
+# ---------------------------------------------------------------------------
 
 async def _handle_session_connected(msg: dict, ws_client):
-    """LabOS Live session confirmed -- start RTSP relay."""
+    """LabOS Live session confirmed -- stop QR, start RTSP relay."""
     publish_rtsp = msg.get("publish_rtsp", "")
     session_id = msg.get("session_id", "")
-    logger.info(f"[Session] LabOS Live connected: {session_id}")
+    logger.info(
+        f"[Session] LabOS Live session_connected received:\n"
+        f"  session_id  : {session_id!r}\n"
+        f"  publish_rtsp: {publish_rtsp!r}\n"
+        f"  full msg    : {json.dumps(msg, indent=2)}"
+    )
 
     stop_qr_scanning()
+    _set_qr_state("LIVE")
 
     if publish_rtsp:
         idx = f"{CAMERA_INDEX:04d}"
         local_path = f"NB_{idx}_TX_CAM_RGB_MIC_p6S"
-        await _start_rtsp_relay(local_path, publish_rtsp)
+        logger.info(
+            f"[Session] Starting RTSP relay for live session:\n"
+            f"  local stream : {local_path}\n"
+            f"  publish to   : {publish_rtsp}"
+        )
+        await _start_rtsp_relay(local_path, publish_rtsp, ws_client=ws_client)
+    else:
+        logger.warning(
+            "[Session] session_connected has no publish_rtsp URL -- "
+            "skipping RTSP relay. The NAT server may not have configured "
+            "an ingest endpoint for this session."
+        )
+
+
+async def _handle_session_connect_failed(msg: dict, ws_client):
+    """LabOS Live session failed -- show error, return to QR scanning."""
+    reason = msg.get("reason", "unknown error")
+    logger.warning(
+        f"[Session] LabOS Live session_connect_failed received:\n"
+        f"  reason  : {reason}\n"
+        f"  full msg: {json.dumps(msg, indent=2)}"
+    )
+
+    await _stop_rtsp_relay()
+    fail_msg = json.dumps({"messages": [
+        {"type": "rich-text", "content": (
+            f'<size=18><color=#FF4444>Connection failed</color></size>'
+            f'<size=14><color=#CCCCCC>\n{reason}</color></size>'
+        )},
+    ]})
+    await _send_to_glasses("SINGLE_STEP_PANEL_CONTENT", fail_msg)
+    await asyncio.sleep(3.0)
+
+    if INITIAL_QR_CODE:
+        _set_qr_state("SCANNING")
+        _launch_qr_scan(ws_client, force=True)
+    else:
+        _set_qr_state("IDLE")
 
 
 async def _handle_session_cleared(ws_client):
-    """LabOS Live session ended -- stop relay, return to QR scanning."""
-    logger.info("[Session] LabOS Live session cleared")
-    await _stop_rtsp_relay()
-
-    if INITIAL_QR_CODE:
-        import asyncio as _aio
-        start_qr_scanning()
-        _aio.create_task(_qr_scan_task(ws_client))
-
-
-async def _restart_qr_flow(ws_client: NATWebSocketClient, *, reset_ws: bool, reason: str) -> None:
-    """Stop current live session state and return to QR scanning."""
-    logger.info(f"[QR] Restart requested: {reason} reset_ws={reset_ws}")
-    stop_qr_scanning()
-    await _stop_rtsp_relay()
-    if reset_ws:
-        await ws_client.reset_session()
-    if INITIAL_QR_CODE:
-        start_qr_scanning()
-        asyncio.create_task(_qr_scan_task(ws_client))
+    """LabOS Live session ended -- full reset, return to QR scanning."""
+    logger.info(
+        f"[Session] LabOS Live session_cleared received "
+        f"(current state={_qr_session_state})"
+    )
+    await _reset_glass_session(
+        ws_client, reset_ws=False, restart_qr=True,
+        reason="NAT session_cleared",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1001,14 +1270,22 @@ async def main():
         if _glasses_connected:
             asyncio.ensure_future(_status.update(server_connection="active"))
 
+    def _on_ws_disconnect():
+        asyncio.ensure_future(_status.update(server_connection="inactive"))
+        asyncio.ensure_future(_stop_rtsp_relay())
+
     ws_client = NATWebSocketClient(
         url=NAT_SERVER_URL,
         session_id=SESSION_ID,
         camera_index=CAMERA_INDEX,
         rtsp_base=f"rtsp://{RTSP_EXTERNAL_HOST}:8554",
         on_connect=_on_ws_connect,
-        on_disconnect=lambda: asyncio.ensure_future(_status.update(server_connection="inactive")),
+        on_disconnect=_on_ws_disconnect,
     )
+
+    _bridge_ctx["stt"] = stt
+    _bridge_ctx["accumulator"] = accumulator
+    _bridge_ctx["ww_filter"] = ww_filter
 
     ws_client.on("agent_response", handle_agent_response)
     ws_client.on("notification", handle_notification)
@@ -1019,11 +1296,12 @@ async def main():
     ws_client.on("wake_timeout", lambda msg: handle_wake_timeout(msg, ww_filter))
     ws_client.on("session_connected", lambda msg: _handle_session_connected(msg, ws_client))
     ws_client.on("session_cleared", lambda msg: _handle_session_cleared(ws_client))
+    ws_client.on("session_connect_failed", lambda msg: _handle_session_connect_failed(msg, ws_client))
 
     ws_task = asyncio.create_task(ws_client.run())
 
     if INITIAL_QR_CODE:
-        asyncio.create_task(_qr_scan_task(ws_client))
+        _launch_qr_scan(ws_client, force=True)
 
     frame_task = None
     if FORWARD_FRAMES:
@@ -1039,6 +1317,7 @@ async def main():
         f"noise_correction={STT_NOISE_CORRECTION_ENABLED} noise_gate_rms={STT_NOISE_GATE_RMS}"
     )
 
+    global _glasses_connected
     audio_seq = 0
     ffmpeg_proc = None
     _retry_delay = 0.05
@@ -1061,7 +1340,10 @@ async def main():
                     f"[Session] Glasses still disconnected after {DISCONNECT_TIMEOUT_S}s "
                     "-- resetting session"
                 )
-                await ws_client.reset_session()
+                await _reset_glass_session(
+                    ws_client, reset_ws=True, restart_qr=True,
+                    reason=f"glasses disconnected for {DISCONNECT_TIMEOUT_S}s",
+                )
         except asyncio.CancelledError:
             logger.info("[Session] Disconnect timer cancelled (glasses reconnected)")
 
@@ -1177,7 +1459,10 @@ async def main():
                 _status.server_connection = "active"
                 await _status.force_push()
 
-                if _last_display_update:
+                if INITIAL_QR_CODE and _qr_session_state != "LIVE":
+                    logger.info("[Bridge] QR mode active, not LIVE -- launching QR scan")
+                    _launch_qr_scan(ws_client)
+                elif _last_display_update:
                     mt, pl = _last_display_update
                     logger.info(f"[Bridge] Replaying cached display_update ({mt})")
                     await _send_to_glasses(mt, pl)
@@ -1329,11 +1614,18 @@ async def main():
 
                 if cleaned:
                     normalized_cmd = " ".join(cleaned.strip().lower().split())
+                    normalized_cmd = normalized_cmd.rstrip(".,!?")
+                    for _filler in (" please", " thanks", " thank you"):
+                        if normalized_cmd.endswith(_filler):
+                            normalized_cmd = normalized_cmd[: -len(_filler)]
+                            break
+
                     if INITIAL_QR_CODE and normalized_cmd in _QR_SHOW_COMMANDS:
                         logger.info(f"[QR] Voice command received: {cleaned}")
                         await send_generic(cleaned, source="User")
-                        await _restart_qr_flow(
-                            ws_client, reset_ws=False, reason="voice command: show qr code",
+                        await _reset_glass_session(
+                            ws_client, reset_ws=False, restart_qr=True,
+                            reason="voice command: show qr code",
                         )
                         await send_generic("QR scanner restarted.", source="System")
                         ww_filter.deactivate()
@@ -1343,10 +1635,36 @@ async def main():
                     if INITIAL_QR_CODE and normalized_cmd in _QR_QUIT_COMMANDS:
                         logger.info(f"[QR] Voice command received: {cleaned}")
                         await send_generic(cleaned, source="User")
-                        await _restart_qr_flow(
-                            ws_client, reset_ws=True, reason="voice command: quit app",
+                        await _reset_glass_session(
+                            ws_client, reset_ws=True, restart_qr=True,
+                            reason="voice command: quit app",
                         )
                         await send_generic("App session reset. QR scanner restarted.", source="System")
+                        ww_filter.deactivate()
+                        await _status.update(voice_assistant="idle")
+                        prev_ww_state = "IDLE"
+                        continue
+                    if normalized_cmd in _SESSION_RESTART_COMMANDS:
+                        logger.info(f"[Session] Voice command received: {cleaned}")
+                        await send_generic(cleaned, source="User")
+                        await _reset_glass_session(
+                            ws_client, reset_ws=True, restart_qr=True,
+                            reason="voice command: restart session",
+                        )
+                        await send_generic("Session restarted.", source="System")
+                        ww_filter.deactivate()
+                        await _status.update(voice_assistant="idle")
+                        prev_ww_state = "IDLE"
+                        continue
+                    if normalized_cmd in _SESSION_QUIT_COMMANDS:
+                        logger.info(f"[Session] Voice command received: {cleaned}")
+                        await send_generic(cleaned, source="User")
+                        await ws_client.send({"type": "session_end"})
+                        await _reset_glass_session(
+                            ws_client, reset_ws=True, restart_qr=True,
+                            reason="voice command: quit session",
+                        )
+                        await send_generic("Session ended.", source="System")
                         ww_filter.deactivate()
                         await _status.update(voice_assistant="idle")
                         prev_ww_state = "IDLE"
